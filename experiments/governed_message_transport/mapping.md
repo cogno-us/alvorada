@@ -9,10 +9,10 @@ Read-only pins inherited from the accepted workbench CI:
 - Agent Action Manifest: `cogno-us/cognous-agent-action-manifest@46c950bed37fe3812000895430bc0312d29e37ce`
 - Authority Context implementation profile: `cogno-us/constitutional-governance-for-institutions@fb3d97938969a89e149e8ff8db2756091d1233fc`
 - Control Plane: `cogno-us/cognous-agent-control-plane@283500652d47a692fb0b99a1172a6d5faffbd9a7`
-- Moltbot Safe: `cogno-us/moltbot-safe@6b0ba1185bcd390f71df947dda349415e4105f5f`
-- Replay Bundle: `cogno-us/cognous-agent-replay-bundle@f12648313cedc2cf06145d397fa56cdea18cc800`
-- Governance Evidence Pack: `cogno-us/cognous-agent-governance-evidence-pack@c699c1fb7c4f8057631c4e5909d11a721c2c958d`
-- ODES: `cogno-us/open-decision-evidence-standard@b3a2f1e72df88cd24d93d1b7d69963f43139e749`
+- Moltbot Safe: `cogno-us/moltbot-safe@1d308faf664c504b6e310db3c7a310153ef7b067`
+- Replay Bundle: `cogno-us/cognous-agent-replay-bundle@f63ce914504dd06813c4ccd199b0570dbd8dd427`
+- Governance Evidence Pack: `cogno-us/cognous-agent-governance-evidence-pack@f1a76187b72d5b7c9fded12580ba081cb9cba338`
+- ODES: `cogno-us/open-decision-evidence-standard@cba83a1c06f718a8afd76178f36e5cc15896347d`
 
 No replacement implementation of those components is included here.
 
