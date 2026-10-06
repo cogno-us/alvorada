@@ -3,6 +3,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -401,3 +404,56 @@ def test_caller_supplied_predecessor_content_cannot_establish_history_when_rehas
     forged_parent_content["packet_digest"] = digest({k: v for k, v in forged_parent_content.items() if k != "packet_digest"})
     p2 = make_successor_packet(forged_parent_content, facts={"decision_id": "d2"}, state_version=2, predecessor_packet_id=p1["packet_id"])
     assert load_successor_packet(p2, None, predecessor=forged_parent_content, store_path=store)["status"] == "predecessor_content_not_accepted_head"
+
+
+def test_supported_runtime_executes_without_upstream_test_directories(tmp_path):
+    molt_root = Path(os.environ["MOLTBOT_SAFE_ROOT"]).resolve()
+    cp_root = Path(os.environ["MOLTBOT_SAFE_CONTROL_PLANE_ROOT"]).resolve()
+    isolated = tmp_path / "moltbot-runtime-only"
+    shutil.copytree(molt_root / "engine", isolated / "engine")
+    assert not (isolated / "tests").exists()
+
+    script = r"""
+import json
+import os
+from pathlib import Path
+from experiments.odex_gax_imx_reference.gax_ref_runtime import (
+    EVAL, LocalRegistry, load_moltbot_runtime, make_message, parse_time,
+    run_exchange, runtime_proposal_model,
+)
+from experiments.odex_gax_imx_reference.synthetic_fixture import build_synthetic_resolver
+
+manifest=json.loads(Path(os.environ["UPSTREAM_MANIFEST_EXAMPLE"]).read_text())
+bundle=json.loads(Path(os.environ["UPSTREAM_REPLAY_SUCCESS_EXAMPLE"]).read_text())
+proposal=runtime_proposal_model(bundle)
+resolver=build_synthetic_resolver(proposal, now=parse_time(EVAL))
+h=load_moltbot_runtime()
+destination=h.DurableRefundDestination(Path(os.environ["ISOLATED_OUT"]) / "destination")
+result=run_exchange(
+    make_message(bundle, message_id="runtime-without-tests"),
+    bundle,
+    LocalRegistry({"refund-sender"},{"refund-recipient"},"refund-recipient"),
+    destination,
+    evaluation_time=EVAL,
+    manifest=manifest,
+    store_path=Path(os.environ["ISOLATED_OUT"]) / "exchange.sqlite",
+    resolver=resolver,
+)
+assert result["execution"]["attempt_status"] == "executed"
+assert result["gax_result_export"]["retention_state"] == "complete_original"
+"""
+    env = os.environ.copy()
+    env["MOLTBOT_SAFE_ROOT"] = str(isolated)
+    env["MOLTBOT_SAFE_CONTROL_PLANE_ROOT"] = str(cp_root)
+    env["ISOLATED_OUT"] = str(tmp_path / "isolated-output")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path.cwd()), str(cp_root / "src"), str(isolated), env.get("PYTHONPATH", "")]
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path.cwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
