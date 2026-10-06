@@ -87,6 +87,18 @@ def _effect_rows(destination: Any) -> list[dict[str, Any]]:
     return _sqlite_rows(Path(destination.path), "effects")
 
 
+def _asdict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return dict(value)
+    return dict(value.__dict__)
+
+
 def _export_sources(workflow: Any, proposal: Any, request: Any, result: Any, destination: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     cp_record = workflow.records.load().model_dump(mode="json")
     all_effects = _sqlite_rows(Path(destination.path), "effects")
@@ -262,10 +274,12 @@ def _run_current_request(
     cp_destination = helper.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}-{record_suffix}.json")
     workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
     decision = workflow.decide(proposal, now=now)
+    proposal_record = proposal.model_dump(mode="json", exclude_none=False)
 
     if decision.result != "authorized":
-        pipe = _pipeline(manifest, record_store.load().model_dump(mode="json"), proposal.model_dump(mode="json", exclude_none=False), None, predecessor=message)
-        return {"status": decision.result, "decision": decision, "result": None, "destination_effects": {}, **pipe}
+        cp_record = record_store.load().model_dump(mode="json")
+        pipe = _pipeline(manifest, cp_record, proposal_record, None, predecessor=message)
+        return {"status": decision.result, "decision": decision, "result": None, "destination_effects": {}, "proposal_record": proposal_record, "cp_record": cp_record, "moltbot_record": None, **pipe}
 
     if mutate_resolver_after_decision:
         mutate_resolver_after_decision(resolver)
@@ -276,7 +290,7 @@ def _run_current_request(
     result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=now, simulate=simulate)
     cp_record, p, moltbot = _export_sources(workflow, proposal, request, result, destination)
     pipe = _pipeline(manifest, cp_record, p, moltbot, predecessor=message)
-    return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, **pipe}
+    return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, "proposal_record": p, "cp_record": cp_record, "moltbot_record": moltbot, **pipe}
 
 
 def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
@@ -324,23 +338,86 @@ def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
     return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, **pipe}
 
 
-def _duplicate_redelivery_result(message: dict[str, Any], assessment: dict[str, Any], destination: Any) -> dict[str, Any]:
-    effects = _effect_rows(destination) if destination is not None else []
-    observed = effects[0]["state"] if effects else "unavailable"
-    effect_id = effects[0]["effect_id"] if effects else None
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def _json_loads(value: str | None) -> Any:
+    return json.loads(value) if value else None
+
+
+def _validate_bound_association(association: dict[str, Any]) -> str | None:
+    proposal = association.get("proposal")
+    moltbot = association.get("moltbot")
+    decision_id = association.get("decision_id")
+    effect_id = association.get("effect_id")
+    if not proposal:
+        return "stored_proposal_unavailable"
+    if not moltbot:
+        return None
+    envelope = moltbot.get("execution_envelope") or {}
+    result = moltbot.get("execution_result") or {}
+    operation = envelope.get("operation") or {}
+    if envelope.get("decision_id") != decision_id or envelope.get("effect_id") != effect_id:
+        return "stored_envelope_identity_mismatch"
+    if result.get("decision_id") != decision_id or result.get("effect_id") != effect_id:
+        return "stored_result_identity_mismatch"
+    h = load_actual_pinned_moltbot_helpers()
+    expected_proposal_commitment = h.commitment(proposal)
+    if operation.get("proposal_commitment") != expected_proposal_commitment:
+        return "stored_operation_proposal_commitment_mismatch"
+    for row in moltbot.get("effects") or []:
+        if row.get("effect_id") != effect_id:
+            return "stored_effect_identity_mismatch"
+    for row in moltbot.get("attempts") or []:
+        if row.get("effect_id") != effect_id or row.get("decision_id") != decision_id:
+            return "stored_attempt_identity_mismatch"
+    return None
+
+
+def _execution_response(assessment: dict[str, Any], status: str, result: Any, decision: Any, artifacts: dict[str, Any], *, attempted_override: bool | None = None, newly_executed_override: bool | None = None) -> dict[str, Any]:
+    assessment["stages"]["authority"] = "authorized" if status in {"executed", "unknown", "partial", "reconciled", "observed"} else status
+    attempted = bool(getattr(result, "attempted", status == "executed"))
+    newly_executed = bool(getattr(result, "newly_executed", False))
+    if attempted_override is not None:
+        attempted = attempted_override
+    if newly_executed_override is not None:
+        newly_executed = newly_executed_override
     return {
         "assessment": assessment,
         "execution": {
-            "attempted": False,
-            "attempt_status": "reconciled" if effects else "duplicate_message",
-            "newly_executed": False,
-            "destination_observed": observed,
-            "effect_id": effect_id,
-            "decision_id": None,
-            "attempt_id": None,
+            "attempted": attempted,
+            "attempt_status": status,
+            "newly_executed": newly_executed,
+            "destination_observed": getattr(result, "observed_state", artifacts["execution_facts"].get("destination_observed")),
+            "effect_id": getattr(result, "effect_id", getattr(decision, "effect_id", None)),
+            "decision_id": getattr(result, "decision_id", getattr(decision, "decision_id", None)),
+            "attempt_id": getattr(result, "attempt_id", None),
         },
-        "successor_packet": make_successor_packet(message, facts={"decision_id": None, "pending_effects": [], "attempts": {}, "unresolved_delivery": False}, current_bundle={}) if effects else None,
+        "current_reconstruction_bundle": artifacts["reconstruction_bundle"],
+        "odes_reference": artifacts["odes_reference"],
+        "successor_packet": artifacts["successor_packet"],
+        "execution_facts": artifacts["execution_facts"],
     }
+
+
+def _duplicate_redelivery_result(message: dict[str, Any], assessment: dict[str, Any], manifest: dict[str, Any], association: dict[str, Any]) -> dict[str, Any]:
+    problem = _validate_bound_association(association)
+    if problem:
+        assessment["errors"].append("GAX-EXECUTION-STORED-WORKFLOW-INTEGRITY-FAILED")
+        return {"assessment": assessment, "execution": {"attempted": False, "reason": problem, "attempt_status": "unresolved_duplicate"}, "successor_packet": None}
+    artifacts = _pipeline(manifest, association["cp_record"], association["proposal"], association.get("moltbot"), predecessor=message)
+    result_data = association.get("result") or {}
+    decision_data = {"decision_id": association.get("decision_id"), "effect_id": association.get("effect_id")}
+    status = association.get("status") or result_data.get("status") or "unresolved"
+    if status == "executed":
+        status = "reconciled"
+    class Obj:
+        def __init__(self, values: dict[str, Any]):
+            self.__dict__.update(values)
+    result = Obj({**result_data, "status": status, "newly_executed": False}) if result_data else None
+    decision = Obj(decision_data)
+    return _execution_response(assessment, status, result, decision, artifacts, attempted_override=False, newly_executed_override=False)
 
 
 def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False) -> dict[str, Any]:
@@ -353,7 +430,12 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
     if assessment["permitted_handling"] != "ACCEPT_FOR_ASSESSMENT":
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "message_not_execution_eligible"}, "successor_packet": None}
     if duplicate:
-        return _duplicate_redelivery_result(message, assessment, destination)
+        association = store.workflow_for_message(message)
+        if association is not None:
+            return _duplicate_redelivery_result(message, assessment, manifest, association)
+        if resolver is None or destination is None:
+            assessment["errors"].append("GAX-EXECUTION-RECEIPT-WITHOUT-COMPLETED-WORKFLOW")
+            return {"assessment": assessment, "execution": {"attempted": False, "reason": "receipt_without_completed_workflow", "attempt_status": "unresolved_duplicate"}, "successor_packet": None}
     if resolver is None:
         assessment["errors"].append("GAX-AUTHORITY-TRUSTED-RESOLVER-REQUIRED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "trusted_resolver_required"}, "successor_packet": None}
@@ -361,10 +443,10 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
         assessment["errors"].append("GAX-EXECUTION-DESTINATION-REQUIRED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "destination_required"}, "successor_packet": None}
     artifacts = _run_current_request(message=message, bundle=bundle, manifest=manifest, destination=destination, store_path=store_path, resolver=resolver, evaluation_time=evaluation_time, mutate_resolver_after_decision=mutate_resolver_after_decision, lose_ack=lose_ack, partial_delivery=partial_delivery)
+    store.record_workflow(message, artifacts)
     result = artifacts.get("result")
     status = artifacts["status"]
-    assessment["stages"]["authority"] = "authorized" if status in {"executed", "unknown", "partial", "reconciled", "observed"} else status
-    return {"assessment": assessment, "execution": {"attempted": bool(getattr(result, "attempted", status == "executed")), "attempt_status": status, "newly_executed": bool(getattr(result, "newly_executed", False)), "destination_observed": getattr(result, "observed_state", artifacts["execution_facts"].get("destination_observed")), "effect_id": getattr(result, "effect_id", getattr(artifacts["decision"], "effect_id", None)), "decision_id": getattr(result, "decision_id", getattr(artifacts["decision"], "decision_id", None)), "attempt_id": getattr(result, "attempt_id", None)}, "current_reconstruction_bundle": artifacts["reconstruction_bundle"], "odes_reference": artifacts["odes_reference"], "successor_packet": artifacts["successor_packet"], "execution_facts": artifacts["execution_facts"]}
+    return _execution_response(assessment, status, result, artifacts["decision"], artifacts)
 
 
 class TransactionalExchangeStore:
@@ -375,6 +457,22 @@ class TransactionalExchangeStore:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS messages(message_id TEXT PRIMARY KEY, message_digest TEXT NOT NULL, conversation_id TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS message_workflows(
+                    message_id TEXT PRIMARY KEY,
+                    message_digest TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    proposal_commitment TEXT,
+                    decision_id TEXT,
+                    effect_id TEXT,
+                    attempt_id TEXT,
+                    proposal_json TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    request_json TEXT,
+                    result_json TEXT,
+                    cp_record_json TEXT NOT NULL,
+                    moltbot_json TEXT
+                );
                 CREATE TABLE IF NOT EXISTS lineage(packet_id TEXT PRIMARY KEY, packet_digest TEXT NOT NULL, conversation_id TEXT NOT NULL, parent_packet_id TEXT, state_version INTEGER NOT NULL, source_packet_id TEXT NOT NULL, source_commitment TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS heads(conversation_id TEXT PRIMARY KEY, packet_id TEXT NOT NULL, packet_digest TEXT NOT NULL, state_version INTEGER NOT NULL);
                 """
@@ -402,6 +500,69 @@ class TransactionalExchangeStore:
             conn.execute("INSERT INTO messages VALUES(?,?,?)", (message["message_id"], message["message_digest"], message["conversation_id"]))
             conn.execute("COMMIT")
             return False, None
+
+    def record_workflow(self, message: dict[str, Any], artifacts: dict[str, Any]) -> None:
+        proposal = artifacts["proposal_record"]
+        decision = _asdict(artifacts.get("decision"))
+        request = _asdict(artifacts.get("request")) if artifacts.get("request") is not None else None
+        result = _asdict(artifacts.get("result")) if artifacts.get("result") is not None else None
+        status = artifacts.get("status") or (result or {}).get("status") or decision.get("result") or "unresolved"
+        decision_id = (result or {}).get("decision_id") or decision.get("decision_id")
+        effect_id = (result or {}).get("effect_id") or decision.get("effect_id")
+        attempt_id = (result or {}).get("attempt_id")
+        proposal_commitment = (request or {}).get("operation", {}).get("proposal_commitment")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT message_digest FROM messages WHERE message_id=?", (message["message_id"],)).fetchone()
+            if row is None or row["message_digest"] != message["message_digest"]:
+                conn.execute("ROLLBACK")
+                raise RuntimeError("message receipt must be recorded before workflow association")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO message_workflows(
+                    message_id,message_digest,conversation_id,status,proposal_commitment,decision_id,effect_id,attempt_id,
+                    proposal_json,decision_json,request_json,result_json,cp_record_json,moltbot_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    message["message_id"],
+                    message["message_digest"],
+                    message["conversation_id"],
+                    status,
+                    proposal_commitment,
+                    decision_id,
+                    effect_id,
+                    attempt_id,
+                    _json_dumps(proposal),
+                    _json_dumps(decision),
+                    _json_dumps(request) if request is not None else None,
+                    _json_dumps(result) if result is not None else None,
+                    _json_dumps(artifacts["cp_record"]),
+                    _json_dumps(artifacts.get("moltbot_record")) if artifacts.get("moltbot_record") is not None else None,
+                ),
+            )
+            conn.execute("COMMIT")
+
+    def workflow_for_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM message_workflows WHERE message_id=?", (message["message_id"],)).fetchone()
+        if row is None:
+            return None
+        if row["message_digest"] != message["message_digest"] or row["conversation_id"] != message["conversation_id"]:
+            return None
+        return {
+            "status": row["status"],
+            "proposal_commitment": row["proposal_commitment"],
+            "decision_id": row["decision_id"],
+            "effect_id": row["effect_id"],
+            "attempt_id": row["attempt_id"],
+            "proposal": _json_loads(row["proposal_json"]),
+            "decision": _json_loads(row["decision_json"]),
+            "request": _json_loads(row["request_json"]),
+            "result": _json_loads(row["result_json"]),
+            "cp_record": _json_loads(row["cp_record_json"]),
+            "moltbot": _json_loads(row["moltbot_json"]),
+        }
 
     @staticmethod
     def _material_digest(packet: dict[str, Any]) -> str:
