@@ -170,8 +170,8 @@ def test_transport_persists_full_original_export_and_returns_it_on_redelivery(tm
         recipient_store_path=tmp_path / "recipient.sqlite",
         routes=routes(),
         recipient_handler=handler,
-        attempt_id_factory=lambda: "transport-attempt",
-        ack_id_factory=lambda: "transport-ack",
+        attempt_id_factory=iter(["transport-attempt-1", "transport-attempt-2"]).__next__,
+        ack_id_factory=iter(["transport-ack-1", "transport-ack-2"]).__next__,
     )
     transport.queue(
         message,
