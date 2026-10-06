@@ -645,6 +645,10 @@ class LocalDurableTransport:
             return self._recipient_reject(envelope, now=now, reason="wrong_or_unknown_recipient_endpoint")
         if not self.routes.verify_sender_endpoint(route, envelope.get("sender_endpoint_ref", "")):
             return self._recipient_reject(envelope, now=now, reason="untrusted_sender_endpoint")
+        if envelope.get("sender_identity_ref") != route.sender_identity_ref:
+            return self._recipient_reject(envelope, now=now, reason="sender_identity_ref_mismatch")
+        if envelope.get("recipient_identity_ref") != route.recipient_identity_ref:
+            return self._recipient_reject(envelope, now=now, reason="recipient_identity_ref_mismatch")
 
         message = envelope.get("governed_message")
         if not isinstance(message, dict):
