@@ -1,4 +1,4 @@
-# ODEX-GAX / IMX Refund Exchange Reference 0.1.0
+# ODEX-GAX / IMX Refund Exchange Reference 0.2.0
 
 This directory contains a bounded experimental reference implementation for a single local synthetic governed exchange:
 
@@ -68,3 +68,28 @@ python -m experiments.odex_gax_imx_reference.demo \
 ```
 
 The demo writes a local JSON artifact only. It creates no external effect and renews no authorization.
+
+
+## Runtime and evidence interfaces
+
+The supported execution path imports Moltbot Safe only through public runtime
+modules. It does not import `tests/test_safe_executor.py` or Control Plane test
+fixtures. The caller must provide a trusted authority resolver; synthetic
+authority construction is confined to `synthetic_fixture.py` for tests and
+examples.
+
+Successful exchanges retain a GAX Result Export `1.0.0` atomically with the
+workflow association. The export contains the original Reconstruction Bundle,
+ODES package and recipient-validation result, IMX successor packet, producer
+identities and artifact commitments.
+
+Exact redelivery returns the retained original export. If an effect was committed
+but evidence export was interrupted, recovery may create a new
+`complete_regenerated_derivative` export from retained Control Plane/executor
+records. The derivative has its own Replay identity and explicit lineage and
+never executes a replacement effect merely to regenerate evidence.
+
+Governed Message Transport `0.2.0` durably retains the GAX Result Export with
+the recipient outcome. A transport crash after recipient processing but before
+outcome persistence recovers through GAX idempotent redelivery and retains the
+existing original export when GAX had already committed it.
