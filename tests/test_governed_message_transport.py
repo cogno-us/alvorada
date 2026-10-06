@@ -222,7 +222,7 @@ def test_wrong_recipient_and_untrusted_sender_fail_before_assessment(tmp_path):
     env["sender_endpoint_ref"] = "local://attacker"
     ack = t.receive_envelope(env, now=NOW)
     assert ack["acknowledgement_kind"] == ACK_KIND_TERMINAL_REJECTION
-    assert ack["detail"]["reason"] == "untrusted_sender_endpoint"
+    assert ack["detail"]["reason"] == "untrusted_or_unknown_route_binding"
     assert handler.call_count(good["message_id"]) == 0
     assert handler.effects() == []
 
@@ -328,7 +328,7 @@ def test_expiry_and_retry_exhaustion_are_terminal_or_unresolved(tmp_path):
     handler = DurableFixtureHandler(tmp_path / "effects.sqlite")
     t = transport(tmp_path, handler, max_attempts=2)
 
-    expired = message(message_id="expired", expires_at="2026-10-06T11:00:00Z")
+    expired = message(message_id="expired", expires_at="2026-10-06T11:59:30Z")
     queue(t, expired)
     result = t.deliver("expired", now=NOW)
     assert result["transport_state"] == "TERMINAL_REJECTED"
