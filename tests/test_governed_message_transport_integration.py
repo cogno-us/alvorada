@@ -15,12 +15,12 @@ from experiments.governed_message_transport import (
 )
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     LocalRegistry,
-    _build_resolver,
-    load_actual_pinned_moltbot_helpers,
+    load_moltbot_runtime,
     make_message,
     parse_time,
     runtime_proposal_model,
 )
+from experiments.odex_gax_imx_reference.synthetic_fixture import build_synthetic_resolver
 
 EVAL = "2026-08-08T01:00:00Z"
 
@@ -59,8 +59,8 @@ def test_transport_to_accepted_gax_assessment_lost_ack_restart_no_second_effect(
     manifest = _load_env("UPSTREAM_MANIFEST_EXAMPLE")
     bundle = _load_env("UPSTREAM_REPLAY_SUCCESS_EXAMPLE")
     proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_actual_pinned_moltbot_helpers()
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    h = load_moltbot_runtime()
     destination = h.DurableRefundDestination(tmp_path / "moltbot-state")
     registry = LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient")
     handler = AcceptedGaxRecipientAdapter(
@@ -127,8 +127,8 @@ def _accepted_fixture(tmp_path: Path):
     manifest = _load_env("UPSTREAM_MANIFEST_EXAMPLE")
     bundle = _load_env("UPSTREAM_REPLAY_SUCCESS_EXAMPLE")
     proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_actual_pinned_moltbot_helpers()
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    h = load_moltbot_runtime()
     destination = h.DurableRefundDestination(tmp_path / "moltbot-state")
     registry = LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient")
     handler = AcceptedGaxRecipientAdapter(
