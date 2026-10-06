@@ -9,11 +9,10 @@ import pytest
 
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     LocalRegistry,
-    _build_resolver,
+    load_executor_runtime,
     actual_executor_classes,
     assess_message,
     digest,
-    load_actual_pinned_moltbot_helpers,
     load_successor_packet,
     make_message,
     make_successor_packet,
@@ -21,6 +20,11 @@ from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     run_actual_outcome,
     run_exchange,
     runtime_proposal_model,
+)
+
+from experiments.odex_gax_imx_reference.synthetic_fixture import (
+    build_synthetic_resolver,
+    synthetic_refund_policy,
 )
 
 EVAL = "2026-08-08T01:00:00Z"
@@ -47,9 +51,9 @@ def registry() -> LocalRegistry:
 def _runtime_fixture(tmp_path: Path, bundle: dict | None = None):
     bundle = bundle or success_bundle()
     proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_actual_pinned_moltbot_helpers()
-    destination = h.DurableRefundDestination(tmp_path / "moltbot-state")
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    runtime = load_executor_runtime()
+    destination = runtime["DurableRefundDestination"](tmp_path / "moltbot-state")
     return resolver, destination
 
 
@@ -79,6 +83,8 @@ def test_run_exchange_success_uses_assessed_request_supplied_resolver_destinatio
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
     )
     assert result["execution"]["attempt_status"] == "executed"
     assert result["execution"]["newly_executed"] is True
@@ -117,8 +123,8 @@ def test_run_exchange_altered_actor_principal_or_scope_cannot_acquire_authority(
         proposal["principal"] = "urn:cognous:principal:attacker"
     else:
         proposal["requested_permissions"] = ["refund.issue.high"]
-    h = load_actual_pinned_moltbot_helpers()
-    destination = h.DurableRefundDestination(tmp_path / mutation / "moltbot-state")
+    runtime = load_executor_runtime()
+    destination = runtime["DurableRefundDestination"](tmp_path / mutation / "moltbot-state")
     result = run_exchange(
         make_message(trial),
         trial,
@@ -128,6 +134,8 @@ def test_run_exchange_altered_actor_principal_or_scope_cannot_acquire_authority(
         manifest=manifest(),
         store_path=tmp_path / mutation / "exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
     )
     assert result["execution"]["attempted"] is False
     assert result["assessment"]["stages"]["authority"] in {"hold", "denied"}
@@ -151,6 +159,8 @@ def test_run_exchange_revocation_after_decision_prevents_execution(tmp_path):
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
         mutate_resolver_after_decision=revoke,
     )
     assert result["execution"]["attempt_status"] == "denied"
@@ -170,14 +180,16 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
         lose_ack=True,
     )
     assert first["execution"]["attempt_status"] == "unknown"
     assert first["successor_packet"]["unresolved_delivery"] is True
     assert len(_effect_rows(destination)) == 1
 
-    h = load_actual_pinned_moltbot_helpers()
-    restarted_destination = h.DurableRefundDestination(destination.root)
+    runtime = load_executor_runtime()
+    restarted_destination = runtime["DurableRefundDestination"](destination.root)
     resolver2, _ = _runtime_fixture(tmp_path / "second")
     second = run_exchange(
         make_message(success_bundle(), message_id="m2"),
@@ -188,6 +200,7 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver2,
+        execution_policy_factory=synthetic_refund_policy,
     )
     assert second["execution"]["attempt_status"] == "reconciled"
     assert second["execution"]["newly_executed"] is False
@@ -203,6 +216,7 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver3,
+        execution_policy_factory=synthetic_refund_policy,
     )
     assert exact_redelivery["execution"]["attempt_status"] == "reconciled"
     assert len(_effect_rows(restarted_destination)) == 1
@@ -219,6 +233,8 @@ def test_run_exchange_partial_delivery_successor_reports_pending_unresolved_effe
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
         partial_delivery=True,
     )
     assert result["execution"]["attempt_status"] == "partial"
