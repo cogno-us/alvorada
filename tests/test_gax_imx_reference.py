@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.executor_runtime_fixture import integrated, policy_for
+
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     LocalRegistry,
     _build_resolver,
@@ -286,8 +288,8 @@ def test_pipeline_exists_for_supported_outcomes(tmp_path, outcome, expected_stat
 
 def test_identical_refund_content_with_different_operation_identity_does_not_reconcile(tmp_path):
     h = load_actual_pinned_moltbot_helpers()
-    helper, proposal, resolver, workflow, decision, destination, executor, request = h._integrated(tmp_path)
-    first = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
+    h, proposal, resolver, workflow, decision, destination, executor, request = integrated(tmp_path)
+    first = executor.execute(envelope=request, proposal=proposal, decision=decision, now=parse_time(EVAL))
     assert first.status == "executed"
     changed_op = h.ExecutionOperation(
         **{
@@ -299,25 +301,25 @@ def test_identical_refund_content_with_different_operation_identity_does_not_rec
     )
     changed = h.ExecutionEnvelope(request.version, request.decision_id, request.effect_id, changed_op)
     with pytest.raises(PermissionError):
-        h.LocalDestinationExecutor(destination, h.policy(changed_op)).observe_historical(changed)
+        h.LocalDestinationExecutor(destination, policy_for(changed_op, proposal, resolver)).observe_historical(changed)
     assert len(_effect_rows(destination)) == 1
 
 
 def test_unrelated_existing_effect_is_not_reused_when_current_operation_fails(tmp_path):
     h = load_actual_pinned_moltbot_helpers()
-    helper, proposal, resolver, workflow, decision, destination, executor, request = h._integrated(tmp_path)
-    assert executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW).status == "executed"
+    h, proposal, resolver, workflow, decision, destination, executor, request = integrated(tmp_path)
+    assert executor.execute(envelope=request, proposal=proposal, decision=decision, now=parse_time(EVAL)).status == "executed"
     other_op = h.ExecutionOperation(
         **{
             **request.operation.__dict__,
             "target": "urn:cognous:synthetic-account:customer-999",
             "payload": {"refund_reason": "other"},
-            "payload_commitment": h.commitment({"refund_reason": "other"}),
-            "proposal_commitment": h.commitment({"unrelated": True}),
+            "payload_commitment": h.executor_commitment({"refund_reason": "other"}),
+            "proposal_commitment": h.executor_commitment({"unrelated": True}),
         }
     )
     other_request = h.ExecutionEnvelope(request.version, "decision-other", "effect-other", other_op)
-    other_result = h.LocalDestinationExecutor(destination, h.policy(other_op)).execute_snapshot(h.snapshot_envelope(other_request))
+    other_result = h.LocalDestinationExecutor(destination, policy_for(other_op, proposal, resolver)).execute_snapshot(h.snapshot_envelope(other_request))
     assert other_result.status == "failed"
     assert other_result.newly_executed is False
     assert {row["effect_id"] for row in _effect_rows(destination)} == {decision.effect_id}
