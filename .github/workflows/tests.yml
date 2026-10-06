@@ -82,8 +82,17 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install package
-        run: pip install -e .[dev]
+      - name: Install pinned integration packages and workbench
+        run: |
+          pip install -e upstream/control-plane
+          pip install -e upstream/replay
+          pip install -e upstream/odes
+          pip install -e .[dev]
+          python - <<'PY'
+          import agent_control_plane
+          import agent_replay_bundle
+          import odes
+          PY
 
       - name: Run tests
         env:
