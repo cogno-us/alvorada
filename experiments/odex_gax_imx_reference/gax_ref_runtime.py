@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import importlib
-import importlib.util
 import json
 import os
 import sqlite3
@@ -26,7 +25,10 @@ runtime_proposal_model = base.runtime_proposal_model
 _build_resolver = base._build_resolver
 
 CP_REVISION = "283500652d47a692fb0b99a1172a6d5faffbd9a7"
-MOLTBOT_REVISION = "6b0ba1185bcd390f71df947dda349415e4105f5f"
+MOLTBOT_REVISION = "894e1c115cb91229c474a906c51ea9af7999e675"
+MOLTBOT_PRODUCER_PROFILE_VERSION = "1.0.0"
+GAX_RESULT_PROFILE = "cognous.gax.transport-result"
+GAX_RESULT_PROFILE_VERSION = "1.0.0"
 MANIFEST_REVISION = "46c950bed37fe3812000895430bc0312d29e37ce"
 REPLAY_REVISION = "f12648313cedc2cf06145d397fa56cdea18cc800"
 ODES_REVISION = "b3a2f1e72df88cd24d93d1b7d69963f43139e749"
@@ -37,36 +39,19 @@ def _repo_path(env_name: str, default: str) -> Path:
     return Path(os.environ.get(env_name, default)).resolve()
 
 
-def load_actual_pinned_moltbot_helpers():
-    cp_root = _repo_path("MOLTBOT_SAFE_CONTROL_PLANE_ROOT", "upstream/control-plane")
-    molt_root = _repo_path("MOLTBOT_SAFE_ROOT", "upstream/moltbot-safe")
-    manifest_path = _repo_path(
-        "MOLTBOT_SAFE_MANIFEST_FIXTURE",
-        os.environ.get("UPSTREAM_MANIFEST_EXAMPLE", "upstream/manifest/examples/refund_integration_v1_1.manifest.json"),
-    )
-    missing = [str(p) for p in (cp_root, molt_root, manifest_path) if not p.exists()]
-    if missing:
-        raise RuntimeError("pinned upstream checkout is unavailable: " + ", ".join(missing))
-    for path in (str(cp_root / "src"), str(molt_root)):
-        if path not in sys.path:
-            sys.path.insert(0, path)
-    os.environ["MOLTBOT_SAFE_CONTROL_PLANE_ROOT"] = str(cp_root)
-    os.environ["MOLTBOT_SAFE_MANIFEST_FIXTURE"] = str(manifest_path)
-    helper_path = molt_root / "tests" / "test_safe_executor.py"
-    spec = importlib.util.spec_from_file_location("alvorada_actual_pinned_moltbot_helpers", helper_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("unable to load pinned Moltbot helper module")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def load_public_executor_runtime():
+    from .executor_runtime import load_public_executor_runtime as _load
+
+    return _load()
 
 
 def actual_executor_classes() -> dict[str, Any]:
-    h = load_actual_pinned_moltbot_helpers()
-    adapter_mod = importlib.import_module("engine.control_plane_adapter")
+    h = load_public_executor_runtime()
     return {
         "PinnedControlPlaneExecutor": h.PinnedControlPlaneExecutor,
-        "ControlPlaneRefundDestinationAdapter": adapter_mod.ControlPlaneRefundDestinationAdapter,
+        "ControlPlaneRefundDestinationAdapter": importlib.import_module(
+            "engine.control_plane_adapter"
+        ).ControlPlaneRefundDestinationAdapter,
         "DurableRefundDestination": h.DurableRefundDestination,
         "ExecutionEnvelope": h.ExecutionEnvelope,
         "ExecutionOperation": h.ExecutionOperation,
@@ -110,32 +95,17 @@ def _manifest() -> dict[str, Any]:
 
 
 def _export_sources(workflow: Any, proposal: Any, request: Any, result: Any, destination: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    h = load_public_executor_runtime()
+    producer = h.export_execution_producer_record(
+        envelope=request,
+        result=result,
+        destination=destination,
+        repository_revision=MOLTBOT_REVISION,
+        provenance_state="source_asserted",
+    )
+    h.validate_execution_producer_record(producer)
     cp_record = workflow.records.load().model_dump(mode="json")
-    all_effects = _sqlite_rows(Path(destination.path), "effects")
-    all_attempts = _sqlite_rows(Path(destination.path), "attempts")
-    all_events = _sqlite_rows(Path(destination.path), "attempt_events")
-    current_effect = request.effect_id
-    current_decision = request.decision_id
-    current_attempt_ids: set[str] = set()
-    if getattr(result, "attempt_id", None):
-        current_attempt_ids.add(str(result.attempt_id))
-    selected_attempts: list[dict[str, Any]] = []
-    for row in all_attempts:
-        if row.get("effect_id") != current_effect:
-            continue
-        if row.get("decision_id") == current_decision or row.get("attempt_id") in current_attempt_ids:
-            selected_attempts.append(row)
-            if row.get("attempt_id"):
-                current_attempt_ids.add(str(row["attempt_id"]))
-    selected_events = [row for row in all_events if row.get("attempt_id") in current_attempt_ids]
-    moltbot = {
-        "execution_envelope": dataclasses.asdict(request),
-        "execution_result": dataclasses.asdict(result),
-        "effects": [row for row in all_effects if row.get("effect_id") == current_effect],
-        "attempts": selected_attempts,
-        "attempt_events": selected_events,
-    }
-    return cp_record, proposal.model_dump(mode="json", exclude_none=False), moltbot
+    return cp_record, proposal.model_dump(mode="json", exclude_none=False), producer
 
 
 def import_replay_bundle(cp_record: dict[str, Any], proposal: dict[str, Any] | None, moltbot: dict[str, Any] | None = None) -> Any:
@@ -200,7 +170,8 @@ def execution_facts(bundle: dict[str, Any]) -> dict[str, Any]:
     return dict(export_odes_reference(_manifest(), bundle)["odes_package"].get("provenance", {}).get("execution_facts", {}))
 
 
-def _build_request_from_decision(h: Any, proposal: Any, resolver: Any, decision: Any) -> Any:
+def _build_request_from_decision(proposal: Any, resolver: Any, decision: Any) -> Any:
+    h = load_public_executor_runtime()
     context = resolver.authority_context(proposal.authority_context_ref or "")
     institution = context.get("institution") if isinstance(context, dict) else {}
     binding = decision.binding
@@ -244,23 +215,27 @@ def _validate_bound_association(association: dict[str, Any]) -> str | None:
     effect_id = association.get("effect_id")
     if not proposal:
         return "stored_proposal_unavailable"
-    moltbot = association.get("moltbot")
-    if not moltbot:
+    producer = association.get("moltbot")
+    if not producer:
         return None
-    envelope = moltbot.get("execution_envelope") or {}
-    result = moltbot.get("execution_result") or {}
+    try:
+        load_public_executor_runtime().validate_execution_producer_record(producer)
+    except Exception:
+        return "stored_executor_producer_contract_invalid"
+    envelope = producer.get("execution_envelope") or {}
+    result = producer.get("execution_result") or {}
     operation = envelope.get("operation") or {}
     if envelope.get("decision_id") != decision_id or envelope.get("effect_id") != effect_id:
         return "stored_envelope_identity_mismatch"
     if result.get("decision_id") != decision_id or result.get("effect_id") != effect_id:
         return "stored_result_identity_mismatch"
-    h = load_actual_pinned_moltbot_helpers()
-    if operation.get("proposal_commitment") != h.commitment(proposal):
+    h = load_public_executor_runtime()
+    if operation.get("proposal_commitment") != h.cp_commitment(proposal):
         return "stored_operation_proposal_commitment_mismatch"
-    for row in moltbot.get("effects") or []:
+    for row in producer.get("effects") or []:
         if row.get("effect_id") != effect_id:
             return "stored_effect_identity_mismatch"
-    for row in moltbot.get("attempts") or []:
+    for row in producer.get("attempts") or []:
         if row.get("effect_id") != effect_id or row.get("decision_id") != decision_id:
             return "stored_attempt_identity_mismatch"
     return None
@@ -335,14 +310,13 @@ def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], man
 
 
 def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], manifest: dict[str, Any], destination: Any, store_path: Path, resolver: Any, evaluation_time: str, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, store: "TransactionalExchangeStore" | None = None, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
-    h = load_actual_pinned_moltbot_helpers()
-    helper = h._load_pinned_helpers()
+    h = load_public_executor_runtime()
     now = parse_time(evaluation_time)
     proposal = runtime_proposal_model(bundle)
     record_suffix = digest({"message_id": message["message_id"], "message_digest": message.get("message_digest"), "evaluation_time": evaluation_time})[-16:]
-    record_store = helper.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}-{record_suffix}.json", proposal.run_id or "run-gax-imx")
-    cp_destination = helper.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}-{record_suffix}.json")
-    workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
+    record_store = h.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}-{record_suffix}.json", proposal.run_id or "run-gax-imx")
+    cp_destination = h.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}-{record_suffix}.json")
+    workflow = h.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
     decision = workflow.decide(proposal, now=now)
     proposal_record = proposal.model_dump(mode="json", exclude_none=False)
     cp_record = record_store.load().model_dump(mode="json")
@@ -354,10 +328,15 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
     if mutate_resolver_after_decision:
         mutate_resolver_after_decision(resolver)
 
-    request = _build_request_from_decision(h, proposal, resolver, decision)
+    request = _build_request_from_decision(proposal, resolver, decision)
     if store is not None:
         store.record_dispatch_checkpoint(message, {"status": "bound", "proposal_record": proposal_record, "decision": _asdict(decision), "request": _asdict(request), "cp_record": cp_record})
-    executor = h.PinnedControlPlaneExecutor(workflow=workflow, destination=destination, policy=h.policy(request.operation))
+    from .executor_runtime import manifest_execution_policy
+    executor = h.PinnedControlPlaneExecutor(
+        workflow=workflow,
+        destination=destination,
+        policy=manifest_execution_policy(manifest, proposal, resolver),
+    )
     simulate = "partial" if partial_delivery else ("lost_ack" if lose_ack else None)
     result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=now, simulate=simulate)
     cp_record, p, moltbot = _export_sources(workflow, proposal, request, result, destination)
