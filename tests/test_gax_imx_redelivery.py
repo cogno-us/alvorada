@@ -96,7 +96,6 @@ def run_success(tmp_path: Path, *, message_id: str = "m-success", destination=No
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
-        execution_policy_factory=synthetic_refund_policy,
     )
     return msg, destination, result
 
@@ -150,7 +149,6 @@ def test_partial_delivery_exact_redelivery_preserves_pending_and_unresolved(tmp_
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
-        execution_policy_factory=synthetic_refund_policy,
         partial_delivery=True,
     )
     original_effect = first["execution"]["effect_id"]
@@ -178,7 +176,6 @@ def test_lost_ack_exact_redelivery_preserves_unknown_unresolved_without_second_e
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
-        execution_policy_factory=synthetic_refund_policy,
         execution_policy_factory=synthetic_refund_policy,
         lose_ack=True,
     )
@@ -211,7 +208,6 @@ def test_receipt_then_failure_before_effect_redelivery_returns_evidence_not_shor
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
-        execution_policy_factory=synthetic_refund_policy,
         execution_policy_factory=synthetic_refund_policy,
         mutate_resolver_after_decision=revoke,
     )
@@ -287,7 +283,6 @@ def test_checkpoint_after_destination_commit_recovers_original_effect_without_re
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
-        execution_policy_factory=synthetic_refund_policy,
         fault_after_dispatch=True,
     )
     original_effect = interrupted["execution"]["effect_id"]
@@ -318,7 +313,6 @@ def test_checkpoint_recovery_with_changed_policy_does_not_issue_replacement_refu
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
-        execution_policy_factory=synthetic_refund_policy,
         fault_after_dispatch=True,
     )
     original_effect = interrupted["execution"]["effect_id"]
@@ -347,7 +341,6 @@ def test_replay_odes_failure_after_commit_retries_evidence_without_repeating_eff
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
-        execution_policy_factory=synthetic_refund_policy,
         execution_policy_factory=synthetic_refund_policy,
         fault_evidence_once=True,
     )
