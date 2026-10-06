@@ -851,6 +851,7 @@ class LocalDurableTransport:
         *,
         now: str,
         reason: str,
+        recoverable: bool = False,
     ) -> dict[str, Any]:
         return self._ack(
             envelope,
@@ -860,6 +861,7 @@ class LocalDurableTransport:
                 "acknowledged_object": "durable_inbox_receipt",
                 "recipient_processing_status": "unresolved",
                 "reason": reason,
+                "recoverable": recoverable,
                 "authorization": "not_established",
                 "execution": "not_established",
                 "destination_observation": "not_established",
@@ -945,6 +947,20 @@ class LocalDurableTransport:
             if fault_after_handler:
                 raise SyntheticTransportInterruption("after_recipient_processing_before_outcome_persistence")
             self.recipient_store.record_recipient_outcome(message["message_id"], outcome)
+            if outcome.result_state in {
+                "recovery_required",
+                "historical_artifacts_unavailable",
+            } or (
+                message_type in EXECUTION_ELIGIBLE_TYPES
+                and outcome.artifact_export is None
+                and outcome.execution.get("effect_id") is not None
+            ):
+                return self._unresolved_receipt_ack(
+                    envelope,
+                    now=trusted_now,
+                    reason="recipient_artifact_retention_incomplete",
+                    recoverable=True,
+                )
         else:
             try:
                 outcome = self.recipient_store.prior_outcome(message["message_id"])
@@ -961,6 +977,7 @@ class LocalDurableTransport:
                         envelope,
                         now=trusted_now,
                         reason="durable_receipt_without_recipient_outcome",
+                        recoverable=False,
                     )
                 outcome = recover(copy.deepcopy(message), delivery_time=trusted_now)
                 if outcome.artifact_export is None:
@@ -968,10 +985,18 @@ class LocalDurableTransport:
                         envelope,
                         now=trusted_now,
                         reason="recipient_recovery_artifacts_unavailable",
+                        recoverable=True,
                     )
                 self.recipient_store.record_recipient_outcome(
                     message["message_id"], outcome
                 )
+                if outcome.artifact_export is None:
+                    return self._unresolved_receipt_ack(
+                        envelope,
+                        now=trusted_now,
+                        reason="recipient_recovery_artifacts_unavailable",
+                        recoverable=True,
+                    )
 
         return self._ack(
             envelope,
@@ -1146,7 +1171,9 @@ class LocalDurableTransport:
             )
             state = "TERMINAL_REJECTED"
         elif kind == ACK_KIND_DURABLE_RECEIPT_UNRESOLVED:
-            reason = (ack.get("detail") or {}).get("reason")
+            detail = ack.get("detail") or {}
+            reason = detail.get("reason")
+            recoverable = bool(detail.get("recoverable"))
             self.sender_store.mark_attempt(
                 attempt_id,
                 state="RECEIPT_UNRESOLVED",
@@ -1154,12 +1181,24 @@ class LocalDurableTransport:
                 acknowledgement_id=ack["acknowledgement_id"],
                 reason=reason,
             )
-            self.sender_store.mark_outbox(
-                message_id,
-                state="UNRESOLVED",
-                terminal_reason=reason,
-            )
-            state = "UNRESOLVED"
+            if recoverable and ordinal < self.max_attempts:
+                next_time = parse_time(trusted_now) + timedelta(
+                    seconds=self.base_backoff_seconds * (2 ** max(0, ordinal - 1))
+                )
+                self.sender_store.mark_outbox(
+                    message_id,
+                    state="PENDING_RETRY",
+                    next_attempt_at=iso(next_time),
+                    terminal_reason=reason,
+                )
+                state = "PENDING_RETRY"
+            else:
+                self.sender_store.mark_outbox(
+                    message_id,
+                    state="UNRESOLVED",
+                    terminal_reason=reason,
+                )
+                state = "UNRESOLVED"
         else:
             self.sender_store.mark_attempt(
                 attempt_id,
@@ -1198,6 +1237,31 @@ class LocalDurableTransport:
                 continue
             results.append(self.deliver(row["message_id"], now=trusted_now, lose_ack=lose_ack))
         return results
+
+    def retained_result(self, message_id: str) -> dict[str, Any]:
+        """Return the versioned retained recipient result without private DB access."""
+        outcome = self.recipient_store.retained_result(message_id)
+        if outcome is None:
+            raise LookupError("recipient result is unavailable")
+        return outcome.as_dict()
+
+    def retained_artifacts(self, message_id: str) -> dict[str, Any]:
+        """Return validated retained GAX artifacts or explicit unavailability."""
+        outcome = self.recipient_store.retained_result(message_id)
+        if outcome is None:
+            return {
+                "result_profile": RECIPIENT_RESULT_PROFILE,
+                "result_version": RECIPIENT_RESULT_VERSION,
+                "result_state": "unavailable",
+                "artifact_export": None,
+            }
+        return {
+            "result_profile": RECIPIENT_RESULT_PROFILE,
+            "result_version": RECIPIENT_RESULT_VERSION,
+            "result_state": outcome.result_state,
+            "producer_refs": copy.deepcopy(outcome.producer_refs),
+            "artifact_export": copy.deepcopy(outcome.artifact_export),
+        }
 
     def evidence(self, message_id: str) -> dict[str, Any]:
         outbox = self.sender_store.outbox_record(message_id)
