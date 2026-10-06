@@ -95,7 +95,7 @@ def run_success(tmp_path: Path, *, message_id: str = "m-success", destination=No
     return msg, destination, result
 
 
-def redeliver(tmp_path: Path, msg: dict, destination, *, partial_delivery: bool = False, lose_ack: bool = False):
+def redeliver(tmp_path: Path, msg: dict, destination, *, partial_delivery: bool = False, lose_ack: bool = False, resolver=None):
     return run_exchange(
         msg,
         success_bundle(),
@@ -104,7 +104,7 @@ def redeliver(tmp_path: Path, msg: dict, destination, *, partial_delivery: bool 
         evaluation_time=EVAL,
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
-        resolver=resolver_for(),
+        resolver=resolver or resolver_for(),
         partial_delivery=partial_delivery,
         lose_ack=lose_ack,
     )
@@ -259,3 +259,87 @@ def test_completed_delivery_exact_redelivery_preserves_original_identity_no_seco
     assert replayed["successor_packet"]["unresolved_delivery"] is False
     assert len(effect_rows(destination)) == 1
     assert_artifacts(replayed)
+
+
+def test_checkpoint_after_destination_commit_recovers_original_effect_without_replacement(tmp_path):
+    destination = destination_at(tmp_path)
+    msg = make_message(success_bundle(), message_id="m-checkpoint-after-dispatch")
+    interrupted = run_exchange(
+        msg,
+        success_bundle(),
+        registry(),
+        destination,
+        evaluation_time=EVAL,
+        manifest=manifest(),
+        store_path=tmp_path / "exchange.sqlite",
+        resolver=resolver_for(),
+        fault_after_dispatch=True,
+    )
+    original_effect = interrupted["execution"]["effect_id"]
+    original_decision = interrupted["execution"]["decision_id"]
+    assert interrupted["execution"]["attempt_status"] == "interrupted_after_dispatch"
+    assert len(effect_rows(destination)) == 1
+
+    restarted = redeliver(tmp_path, msg, destination)
+
+    assert restarted["execution"]["attempt_status"] == "reconciled"
+    assert restarted["execution"]["effect_id"] == original_effect
+    assert restarted["execution"]["decision_id"] == original_decision
+    assert restarted["execution"]["newly_executed"] is False
+    assert len(effect_rows(destination)) == 1
+    assert_artifacts(restarted)
+
+
+def test_checkpoint_recovery_with_changed_policy_does_not_issue_replacement_refund(tmp_path):
+    destination = destination_at(tmp_path)
+    msg = make_message(success_bundle(), message_id="m-checkpoint-policy-change")
+    interrupted = run_exchange(
+        msg,
+        success_bundle(),
+        registry(),
+        destination,
+        evaluation_time=EVAL,
+        manifest=manifest(),
+        store_path=tmp_path / "exchange.sqlite",
+        resolver=resolver_for(),
+        fault_after_dispatch=True,
+    )
+    original_effect = interrupted["execution"]["effect_id"]
+
+    changed = resolver_for()
+    grant_id = next(iter(changed.statuses))
+    changed.statuses[grant_id].status = "revoked"
+    restarted = redeliver(tmp_path, msg, destination, resolver=changed)
+
+    assert restarted["execution"]["attempt_status"] == "reconciled"
+    assert restarted["execution"]["effect_id"] == original_effect
+    assert restarted["execution"]["newly_executed"] is False
+    assert len(effect_rows(destination)) == 1
+    assert_artifacts(restarted)
+
+
+def test_replay_odes_failure_after_commit_retries_evidence_without_repeating_effect(tmp_path):
+    destination = destination_at(tmp_path)
+    msg = make_message(success_bundle(), message_id="m-evidence-fault")
+    interrupted = run_exchange(
+        msg,
+        success_bundle(),
+        registry(),
+        destination,
+        evaluation_time=EVAL,
+        manifest=manifest(),
+        store_path=tmp_path / "exchange.sqlite",
+        resolver=resolver_for(),
+        fault_evidence_once=True,
+    )
+    original_effect = interrupted["execution"]["effect_id"]
+    assert interrupted["execution"]["attempt_status"] == "evidence_export_failed"
+    assert len(effect_rows(destination)) == 1
+
+    retried = redeliver(tmp_path, msg, destination)
+
+    assert retried["execution"]["attempt_status"] == "reconciled"
+    assert retried["execution"]["effect_id"] == original_effect
+    assert retried["execution"]["newly_executed"] is False
+    assert len(effect_rows(destination)) == 1
+    assert_artifacts(retried)
