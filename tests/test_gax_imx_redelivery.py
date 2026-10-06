@@ -7,13 +7,13 @@ from pathlib import Path
 
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     LocalRegistry,
-    _build_resolver,
-    load_actual_pinned_moltbot_helpers,
+    load_moltbot_runtime,
     make_message,
     parse_time,
     run_exchange,
     runtime_proposal_model,
 )
+from experiments.odex_gax_imx_reference.synthetic_fixture import build_synthetic_resolver
 
 EVAL = "2026-08-08T01:00:00Z"
 
@@ -38,11 +38,11 @@ def registry() -> LocalRegistry:
 
 def resolver_for(bundle: dict | None = None):
     proposal = runtime_proposal_model(bundle or success_bundle())
-    return _build_resolver(proposal, now=parse_time(EVAL))
+    return build_synthetic_resolver(proposal, now=parse_time(EVAL))
 
 
 def destination_at(tmp_path: Path):
-    h = load_actual_pinned_moltbot_helpers()
+    h = load_moltbot_runtime()
     return h.DurableRefundDestination(tmp_path / "moltbot-state")
 
 
