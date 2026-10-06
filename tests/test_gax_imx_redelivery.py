@@ -101,7 +101,7 @@ def redeliver(tmp_path: Path, msg: dict, destination, *, partial_delivery: bool 
         success_bundle(),
         registry(),
         destination,
-        evaluation_time="2026-08-08T01:05:00Z",
+        evaluation_time=EVAL,
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
