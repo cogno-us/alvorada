@@ -24,9 +24,9 @@ parse_time = base.parse_time
 runtime_proposal_model = base.runtime_proposal_model
 
 CP_REVISION = "283500652d47a692fb0b99a1172a6d5faffbd9a7"
-MOLTBOT_REVISION = "1af0351c18c3339b2978a33e284b59febb465426"  # proposed dependency head
+MOLTBOT_REVISION = "054e92d12ccb0bc756ca6652f39fc13b51e05d9b"  # proposed dependency head
 MANIFEST_REVISION = "46c950bed37fe3812000895430bc0312d29e37ce"
-REPLAY_REVISION = "f12648313cedc2cf06145d397fa56cdea18cc800"
+REPLAY_REVISION = "22aa742b2735b64b850c2c37688ef1fae5ff9014"  # proposed dependency head
 ODES_REVISION = "b3a2f1e72df88cd24d93d1b7d69963f43139e749"
 ALVORADA_REVISION = "fb3d97938969a89e149e8ff8db2756091d1233fc"
 MOLTBOT_PRODUCER_PROFILE_ID = "urn:cognous:profiles:moltbot-safe-executor-producer"
@@ -270,6 +270,95 @@ def _validate_bound_association(association: dict[str, Any]) -> str | None:
     return None
 
 
+def _retained_artifact_export(
+    artifacts: dict[str, Any],
+    *,
+    state: str,
+    lineage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reconstruction = copy_value = json.loads(_json_dumps(artifacts["reconstruction_bundle"]))
+    odes_ref = artifacts["odes_reference"]
+    odes_retained = {
+        "odes_package": json.loads(_json_dumps(odes_ref.get("odes_package"))),
+        "recipient_validation": json.loads(_json_dumps(odes_ref.get("recipient_validation"))),
+        "exchange_metadata": json.loads(_json_dumps(odes_ref.get("exchange_metadata") or {})),
+    }
+    successor = json.loads(_json_dumps(artifacts.get("successor_packet"))) if artifacts.get("successor_packet") is not None else None
+    refs = {
+        "reconstruction_bundle_id": reconstruction.get("bundle_id"),
+        "reconstruction_digest": digest(reconstruction),
+        "odes_package_digest": digest(odes_retained["odes_package"]) if odes_retained["odes_package"] is not None else None,
+        "odes_validation_digest": digest(odes_retained["recipient_validation"]) if odes_retained["recipient_validation"] is not None else None,
+        "successor_packet_id": successor.get("packet_id") if isinstance(successor, dict) else None,
+        "successor_packet_digest": (
+            successor.get("packet_digest") if isinstance(successor, dict) else None
+        ),
+    }
+    return {
+        "export_profile": GAX_ARTIFACT_EXPORT_PROFILE,
+        "export_version": GAX_ARTIFACT_EXPORT_VERSION,
+        "state": state,
+        "reconstruction_bundle": reconstruction,
+        "odes": odes_retained,
+        "successor_packet": successor,
+        "producer_refs": refs,
+        "lineage": json.loads(_json_dumps(lineage or {"relationship": "original"})),
+    }
+
+
+def _validate_retained_artifact_export(value: dict[str, Any]) -> str | None:
+    if value.get("export_profile") != GAX_ARTIFACT_EXPORT_PROFILE:
+        return "unsupported_artifact_export_profile"
+    if value.get("export_version") != GAX_ARTIFACT_EXPORT_VERSION:
+        return "unsupported_artifact_export_version"
+    reconstruction = value.get("reconstruction_bundle")
+    odes = value.get("odes") or {}
+    successor = value.get("successor_packet")
+    refs = value.get("producer_refs") or {}
+    if not isinstance(reconstruction, dict):
+        return "retained_reconstruction_missing"
+    if refs.get("reconstruction_bundle_id") != reconstruction.get("bundle_id"):
+        return "retained_reconstruction_identity_mismatch"
+    if refs.get("reconstruction_digest") != digest(reconstruction):
+        return "retained_reconstruction_digest_mismatch"
+    package = odes.get("odes_package")
+    validation = odes.get("recipient_validation")
+    if package is not None and refs.get("odes_package_digest") != digest(package):
+        return "retained_odes_package_digest_mismatch"
+    if validation is not None and refs.get("odes_validation_digest") != digest(validation):
+        return "retained_odes_validation_digest_mismatch"
+    if successor is not None:
+        if refs.get("successor_packet_id") != successor.get("packet_id"):
+            return "retained_successor_identity_mismatch"
+        if refs.get("successor_packet_digest") != successor.get("packet_digest"):
+            return "retained_successor_digest_mismatch"
+        if successor.get("packet_digest") != digest({k: v for k, v in successor.items() if k != "packet_digest"}):
+            return "retained_successor_content_digest_mismatch"
+    return None
+
+
+def _artifacts_from_retained_export(value: dict[str, Any]) -> dict[str, Any]:
+    problem = _validate_retained_artifact_export(value)
+    if problem:
+        raise ValueError(problem)
+    odes = value["odes"]
+    facts = _artifact_facts({
+        "odes_package": odes["odes_package"],
+        "recipient_validation": odes.get("recipient_validation"),
+    })
+    return {
+        "reconstruction_bundle": value["reconstruction_bundle"],
+        "odes_reference": {
+            "odes_package": odes["odes_package"],
+            "recipient_validation": odes.get("recipient_validation"),
+            "exchange_metadata": odes.get("exchange_metadata") or {},
+        },
+        "successor_packet": value.get("successor_packet"),
+        "execution_facts": facts,
+        "artifact_export": value,
+    }
+
+
 def _execution_response(assessment: dict[str, Any], status: str, result: Any, decision: Any, artifacts: dict[str, Any], *, attempted_override: bool | None = None, newly_executed_override: bool | None = None) -> dict[str, Any]:
     assessment["stages"]["authority"] = "authorized" if status in {"executed", "unknown", "partial", "reconciled", "observed"} else status
     attempted = bool(getattr(result, "attempted", status == "executed"))
@@ -293,11 +382,15 @@ def _execution_response(assessment: dict[str, Any], status: str, result: Any, de
         "odes_reference": artifacts["odes_reference"],
         "successor_packet": artifacts["successor_packet"],
         "execution_facts": artifacts["execution_facts"],
+        "artifact_export": artifacts.get("artifact_export"),
     }
 
 
 def _artifacts_from_association(manifest: dict[str, Any], message: dict[str, Any], association: dict[str, Any]) -> dict[str, Any]:
-    return _pipeline(manifest, association["cp_record"], association["proposal"], association.get("moltbot"), predecessor=message)
+    retained = association.get("artifact_export")
+    if not isinstance(retained, dict):
+        raise LookupError("original_artifacts_unavailable")
+    return _artifacts_from_retained_export(retained)
 
 
 def _duplicate_redelivery_result(message: dict[str, Any], assessment: dict[str, Any], manifest: dict[str, Any], association: dict[str, Any]) -> dict[str, Any]:
@@ -305,7 +398,20 @@ def _duplicate_redelivery_result(message: dict[str, Any], assessment: dict[str, 
     if problem:
         assessment["errors"].append("GAX-EXECUTION-STORED-WORKFLOW-INTEGRITY-FAILED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": problem, "attempt_status": "unresolved_duplicate"}, "successor_packet": None}
-    artifacts = _artifacts_from_association(manifest, message, association)
+    try:
+        artifacts = _artifacts_from_association(manifest, message, association)
+    except (LookupError, ValueError) as exc:
+        assessment["errors"].append("GAX-ARTIFACTS-UNAVAILABLE-OR-INVALID")
+        return {
+            "assessment": assessment,
+            "execution": {
+                "attempted": False,
+                "reason": str(exc),
+                "attempt_status": "unresolved_duplicate",
+            },
+            "successor_packet": None,
+            "artifact_export": None,
+        }
     result_data = association.get("result") or {}
     status = association.get("status") or result_data.get("status") or "unresolved"
     if status == "executed":
@@ -321,14 +427,50 @@ def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], man
         assessment["errors"].append("GAX-EXECUTION-CHECKPOINT-INTEGRITY-FAILED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": problem, "attempt_status": "hold"}, "successor_packet": None}
     if checkpoint.get("moltbot") and checkpoint.get("result"):
-        artifacts = _artifacts_from_association(manifest, message, checkpoint)
-        store.record_workflow(message, {"proposal_record": checkpoint["proposal"], "decision": checkpoint["decision"], "request": checkpoint.get("request"), "result": checkpoint.get("result"), "status": checkpoint.get("status") or checkpoint["result"].get("status"), "cp_record": checkpoint["cp_record"], "moltbot_record": checkpoint.get("moltbot")})
+        pipe = _pipeline(
+            manifest,
+            checkpoint["cp_record"],
+            checkpoint["proposal"],
+            checkpoint.get("moltbot"),
+            predecessor=message,
+        )
+        source_commitment = digest({
+            "cp_record": checkpoint["cp_record"],
+            "proposal": checkpoint["proposal"],
+            "moltbot": checkpoint.get("moltbot"),
+        })
+        pipe["artifact_export"] = _retained_artifact_export(
+            pipe,
+            state="regenerated_derivative",
+            lineage={
+                "relationship": "regenerated_derivative",
+                "original_artifacts": "unavailable",
+                "source_checkpoint_commitment": source_commitment,
+                "effect_reexecution": False,
+            },
+        )
+        store.record_workflow(
+            message,
+            {
+                "proposal_record": checkpoint["proposal"],
+                "decision": checkpoint["decision"],
+                "request": checkpoint.get("request"),
+                "result": checkpoint.get("result"),
+                "status": checkpoint.get("status") or checkpoint["result"].get("status"),
+                "cp_record": checkpoint["cp_record"],
+                "moltbot_record": checkpoint.get("moltbot"),
+                **pipe,
+            },
+        )
         status = checkpoint.get("status") or checkpoint["result"].get("status") or "reconciled"
         if status == "executed":
             status = "reconciled"
         result = Obj({**checkpoint["result"], "status": status, "newly_executed": False})
         decision = Obj({"decision_id": checkpoint.get("decision_id"), "effect_id": checkpoint.get("effect_id")})
-        return _execution_response(assessment, status, result, decision, artifacts, attempted_override=False, newly_executed_override=False)
+        return _execution_response(
+            assessment, status, result, decision, pipe,
+            attempted_override=False, newly_executed_override=False,
+        )
     if destination is not None:
         rows = [r for r in _effect_rows(destination) if r.get("effect_id") == checkpoint.get("effect_id")]
         if rows:
@@ -353,6 +495,11 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
 
     if decision.result != "authorized":
         pipe = _pipeline(manifest, cp_record, proposal_record, None, predecessor=message)
+        pipe["artifact_export"] = _retained_artifact_export(
+            pipe,
+            state="original_complete",
+            lineage={"relationship": "original", "effect_reexecution": False},
+        )
         return {"status": decision.result, "decision": decision, "result": None, "destination_effects": {}, "proposal_record": proposal_record, "cp_record": cp_record, "moltbot_record": None, **pipe}
 
     if mutate_resolver_after_decision:
@@ -380,6 +527,11 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
     if fault_evidence_once and store is not None and not store.consume_fault_once(message["message_id"], "evidence_export"):
         return {"status": "evidence_export_failed", "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, "proposal_record": p, "cp_record": cp_record, "moltbot_record": moltbot, "fault": "replay_odes_export_failed_after_dispatch"}
     pipe = _pipeline(manifest, cp_record, p, moltbot, predecessor=message)
+    pipe["artifact_export"] = _retained_artifact_export(
+        pipe,
+        state="original_complete",
+        lineage={"relationship": "original", "effect_reexecution": False},
+    )
     return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, "proposal_record": p, "cp_record": cp_record, "moltbot_record": moltbot, **pipe}
 
 
@@ -436,6 +588,7 @@ class TransactionalExchangeStore:
                 CREATE TABLE IF NOT EXISTS messages(message_id TEXT PRIMARY KEY, message_digest TEXT NOT NULL, conversation_id TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS message_workflows(message_id TEXT PRIMARY KEY,message_digest TEXT NOT NULL,conversation_id TEXT NOT NULL,status TEXT NOT NULL,proposal_commitment TEXT,decision_id TEXT,effect_id TEXT,attempt_id TEXT,proposal_json TEXT NOT NULL,decision_json TEXT NOT NULL,request_json TEXT,result_json TEXT,cp_record_json TEXT NOT NULL,moltbot_json TEXT);
                 CREATE TABLE IF NOT EXISTS dispatch_checkpoints(message_id TEXT PRIMARY KEY,message_digest TEXT NOT NULL,conversation_id TEXT NOT NULL,state TEXT NOT NULL,proposal_commitment TEXT,decision_id TEXT,effect_id TEXT,attempt_id TEXT,proposal_json TEXT NOT NULL,decision_json TEXT NOT NULL,request_json TEXT,result_json TEXT,cp_record_json TEXT NOT NULL,moltbot_json TEXT,faults_json TEXT);
+                CREATE TABLE IF NOT EXISTS artifact_exports(message_id TEXT PRIMARY KEY,message_digest TEXT NOT NULL,conversation_id TEXT NOT NULL,export_profile TEXT NOT NULL,export_version TEXT NOT NULL,state TEXT NOT NULL,artifact_json TEXT NOT NULL,artifact_digest TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS lineage(packet_id TEXT PRIMARY KEY, packet_digest TEXT NOT NULL, conversation_id TEXT NOT NULL, parent_packet_id TEXT, state_version INTEGER NOT NULL, source_packet_id TEXT NOT NULL, source_commitment TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS heads(conversation_id TEXT PRIMARY KEY, packet_id TEXT NOT NULL, packet_digest TEXT NOT NULL, state_version INTEGER NOT NULL);
                 """
@@ -512,6 +665,24 @@ class TransactionalExchangeStore:
             conn.execute("COMMIT")
             return already
 
+    def artifact_export_for_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifact_exports WHERE message_id=?",
+                (message["message_id"],),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["message_digest"] != message["message_digest"] or row["conversation_id"] != message["conversation_id"]:
+            return None
+        value = _json_loads(row["artifact_json"])
+        if row["artifact_digest"] != digest(value):
+            raise ValueError("retained_artifact_row_digest_mismatch")
+        problem = _validate_retained_artifact_export(value)
+        if problem:
+            raise ValueError(problem)
+        return value
+
     def record_workflow(self, message: dict[str, Any], artifacts: dict[str, Any]) -> None:
         proposal = artifacts["proposal_record"]
         decision = _asdict(artifacts.get("decision"))
@@ -528,7 +699,24 @@ class TransactionalExchangeStore:
             if row is None or row["message_digest"] != message["message_digest"]:
                 conn.execute("ROLLBACK")
                 raise RuntimeError("message receipt must be recorded before workflow association")
+            artifact_export = artifacts.get("artifact_export")
+            if not isinstance(artifact_export, dict):
+                conn.execute("ROLLBACK")
+                raise RuntimeError("workflow completion requires a retained artifact export")
+            problem = _validate_retained_artifact_export(artifact_export)
+            if problem:
+                conn.execute("ROLLBACK")
+                raise RuntimeError(problem)
+            encoded_export = _json_dumps(artifact_export)
             conn.execute("""INSERT OR REPLACE INTO message_workflows(message_id,message_digest,conversation_id,status,proposal_commitment,decision_id,effect_id,attempt_id,proposal_json,decision_json,request_json,result_json,cp_record_json,moltbot_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (message["message_id"], message["message_digest"], message["conversation_id"], status, proposal_commitment, decision_id, effect_id, attempt_id, _json_dumps(proposal), _json_dumps(decision), _json_dumps(request) if request is not None else None, _json_dumps(result) if result is not None else None, _json_dumps(artifacts["cp_record"]), _json_dumps(artifacts.get("moltbot_record")) if artifacts.get("moltbot_record") is not None else None))
+            conn.execute(
+                """INSERT OR REPLACE INTO artifact_exports(message_id,message_digest,conversation_id,export_profile,export_version,state,artifact_json,artifact_digest) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    message["message_id"], message["message_digest"], message["conversation_id"],
+                    artifact_export["export_profile"], artifact_export["export_version"],
+                    artifact_export["state"], encoded_export, digest(artifact_export),
+                ),
+            )
             conn.execute("COMMIT")
 
     def workflow_for_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -536,7 +724,9 @@ class TransactionalExchangeStore:
             row = conn.execute("SELECT * FROM message_workflows WHERE message_id=?", (message["message_id"],)).fetchone()
         if row is None or row["message_digest"] != message["message_digest"] or row["conversation_id"] != message["conversation_id"]:
             return None
-        return self._association_payload(row)
+        out = self._association_payload(row)
+        out["artifact_export"] = self.artifact_export_for_message(message)
+        return out
 
     @staticmethod
     def _material_digest(packet: dict[str, Any]) -> str:
