@@ -9,11 +9,10 @@ import pytest
 
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     LocalRegistry,
-    _build_resolver,
     actual_executor_classes,
     assess_message,
     digest,
-    load_actual_pinned_moltbot_helpers,
+    load_moltbot_runtime,
     load_successor_packet,
     make_message,
     make_successor_packet,
@@ -22,6 +21,7 @@ from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     run_exchange,
     runtime_proposal_model,
 )
+from experiments.odex_gax_imx_reference.synthetic_fixture import build_synthetic_resolver
 
 EVAL = "2026-08-08T01:00:00Z"
 
@@ -47,8 +47,8 @@ def registry() -> LocalRegistry:
 def _runtime_fixture(tmp_path: Path, bundle: dict | None = None):
     bundle = bundle or success_bundle()
     proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_actual_pinned_moltbot_helpers()
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    h = load_moltbot_runtime()
     destination = h.DurableRefundDestination(tmp_path / "moltbot-state")
     return resolver, destination
 
@@ -117,7 +117,7 @@ def test_run_exchange_altered_actor_principal_or_scope_cannot_acquire_authority(
         proposal["principal"] = "urn:cognous:principal:attacker"
     else:
         proposal["requested_permissions"] = ["refund.issue.high"]
-    h = load_actual_pinned_moltbot_helpers()
+    h = load_moltbot_runtime()
     destination = h.DurableRefundDestination(tmp_path / mutation / "moltbot-state")
     result = run_exchange(
         make_message(trial),
@@ -176,7 +176,7 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
     assert first["successor_packet"]["unresolved_delivery"] is True
     assert len(_effect_rows(destination)) == 1
 
-    h = load_actual_pinned_moltbot_helpers()
+    h = load_moltbot_runtime()
     restarted_destination = h.DurableRefundDestination(destination.root)
     resolver2, _ = _runtime_fixture(tmp_path / "second")
     second = run_exchange(
@@ -285,7 +285,7 @@ def test_pipeline_exists_for_supported_outcomes(tmp_path, outcome, expected_stat
 
 
 def test_identical_refund_content_with_different_operation_identity_does_not_reconcile(tmp_path):
-    h = load_actual_pinned_moltbot_helpers()
+    h = load_moltbot_runtime()
     helper, proposal, resolver, workflow, decision, destination, executor, request = h._integrated(tmp_path)
     first = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
     assert first.status == "executed"
@@ -304,7 +304,7 @@ def test_identical_refund_content_with_different_operation_identity_does_not_rec
 
 
 def test_unrelated_existing_effect_is_not_reused_when_current_operation_fails(tmp_path):
-    h = load_actual_pinned_moltbot_helpers()
+    h = load_moltbot_runtime()
     helper, proposal, resolver, workflow, decision, destination, executor, request = h._integrated(tmp_path)
     assert executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW).status == "executed"
     other_op = h.ExecutionOperation(
