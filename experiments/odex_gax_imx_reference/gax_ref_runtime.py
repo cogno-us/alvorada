@@ -23,6 +23,59 @@ parse_time = base.parse_time
 runtime_proposal_model = base.runtime_proposal_model
 
 
+def _matching_existing_effect(destination: DestinationState, proposal: Any) -> dict[str, Any] | None:
+    p = proposal.model_dump(mode="json", exclude_none=False)
+    for effect in destination.effects.values():
+        try:
+            amount_matches = float(effect.get("amount")) == float(p.get("amount"))
+        except Exception:
+            amount_matches = effect.get("amount") == p.get("amount")
+        if (
+            effect.get("target") == p.get("target")
+            and amount_matches
+            and effect.get("unit") == p.get("unit")
+            and effect.get("payload") == p.get("payload")
+        ):
+            return effect
+    return None
+
+
+def _reconciled_result(
+    *,
+    assessment: dict[str, Any],
+    effect: dict[str, Any],
+    decision: Any,
+    manifest: dict[str, Any],
+    proposal: Any,
+    record_store: Any,
+    destination: DestinationState,
+    original_bundle: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    assessment["stages"]["authority"] = "authorized"
+    return {
+        "assessment": assessment,
+        "execution": {
+            "attempted": True,
+            "attempt_status": "reconciled_existing",
+            "newly_executed": False,
+            "destination_observed": effect.get("state", "unknown"),
+            "effect_id": effect["effect_id"],
+            "decision_id": decision.decision_id,
+            "attempt_id": None,
+            "reconciliation_reason": reason,
+        },
+        "current_reconstruction_bundle": base._reconstruction_from_run(
+            manifest,
+            proposal,
+            decision,
+            record_store.load(),
+            destination,
+            original_bundle=original_bundle,
+        ),
+    }
+
+
 def run_exchange(
     message: dict[str, Any],
     bundle: dict[str, Any],
@@ -71,6 +124,20 @@ def run_exchange(
     if mutate_resolver_after_decision:
         mutate_resolver_after_decision(resolver)
 
+    existing_effect = _matching_existing_effect(destination, proposal)
+    if existing_effect:
+        return _reconciled_result(
+            assessment=assessment,
+            effect=existing_effect,
+            decision=decision,
+            manifest=manifest,
+            proposal=proposal,
+            record_store=record_store,
+            destination=destination,
+            original_bundle=bundle,
+            reason="matching_effect_already_committed",
+        )
+
     same_effect, err = store.bind_effect(decision.effect_id, op_hash)
     if err:
         assessment["errors"].append(err)
@@ -89,21 +156,17 @@ def run_exchange(
         snapshot = destination.effects
         if snapshot:
             effect = next(iter(snapshot.values()))
-            assessment["stages"]["authority"] = "authorized"
-            return {
-                "assessment": assessment,
-                "execution": {
-                    "attempted": True,
-                    "attempt_status": "reconciled_existing",
-                    "newly_executed": False,
-                    "destination_observed": effect.get("state", "unknown"),
-                    "effect_id": effect["effect_id"],
-                    "decision_id": decision.decision_id,
-                    "attempt_id": None,
-                    "reconciliation_reason": str(exc),
-                },
-                "current_reconstruction_bundle": base._reconstruction_from_run(manifest, proposal, decision, record_store.load(), destination, original_bundle=bundle),
-            }
+            return _reconciled_result(
+                assessment=assessment,
+                effect=effect,
+                decision=decision,
+                manifest=manifest,
+                proposal=proposal,
+                record_store=record_store,
+                destination=destination,
+                original_bundle=bundle,
+                reason=str(exc),
+            )
         return {"assessment": assessment, "execution": {"attempted": False, "reason": str(exc), "effect_id": decision.effect_id}}
 
     current = base._reconstruction_from_run(manifest, proposal, decision, record_store.load(), destination, original_bundle=bundle)
