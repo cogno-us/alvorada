@@ -43,14 +43,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: cogno-us/moltbot-safe
-          ref: 6b0ba1185bcd390f71df947dda349415e4105f5f
+          ref: 054e92d12ccb0bc756ca6652f39fc13b51e05d9b
           path: upstream/moltbot-safe
 
       - name: Checkout pinned Replay
         uses: actions/checkout@v4
         with:
           repository: cogno-us/cognous-agent-replay-bundle
-          ref: f12648313cedc2cf06145d397fa56cdea18cc800
+          ref: 10f96bdc5c36ba3635793469837e9c420397b547
           path: upstream/replay
 
       - name: Checkout pinned Evidence Pack
@@ -64,7 +64,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: cogno-us/open-decision-evidence-standard
-          ref: b3a2f1e72df88cd24d93d1b7d69963f43139e749
+          ref: a501f12f6d044f2da10947ff7c61e00184257071
           path: upstream/odes
 
       - name: Verify pinned revisions
@@ -72,10 +72,10 @@ jobs:
           test "$(git -C upstream/manifest rev-parse HEAD)" = "46c950bed37fe3812000895430bc0312d29e37ce"
           test "$(git -C upstream/authority-context rev-parse HEAD)" = "fb3d97938969a89e149e8ff8db2756091d1233fc"
           test "$(git -C upstream/control-plane rev-parse HEAD)" = "283500652d47a692fb0b99a1172a6d5faffbd9a7"
-          test "$(git -C upstream/moltbot-safe rev-parse HEAD)" = "6b0ba1185bcd390f71df947dda349415e4105f5f"
-          test "$(git -C upstream/replay rev-parse HEAD)" = "f12648313cedc2cf06145d397fa56cdea18cc800"
+          test "$(git -C upstream/moltbot-safe rev-parse HEAD)" = "054e92d12ccb0bc756ca6652f39fc13b51e05d9b"
+          test "$(git -C upstream/replay rev-parse HEAD)" = "10f96bdc5c36ba3635793469837e9c420397b547"
           test "$(git -C upstream/evidence-pack rev-parse HEAD)" = "c699c1fb7c4f8057631c4e5909d11a721c2c958d"
-          test "$(git -C upstream/odes rev-parse HEAD)" = "b3a2f1e72df88cd24d93d1b7d69963f43139e749"
+          test "$(git -C upstream/odes rev-parse HEAD)" = "a501f12f6d044f2da10947ff7c61e00184257071"
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
