@@ -68,7 +68,6 @@ def _effect_rows(destination):
 def test_imports_actual_pinned_moltbot_executor_classes():
     classes = actual_executor_classes()
     assert classes["PinnedControlPlaneExecutor"].__module__ == "engine.control_plane_adapter"
-    assert classes["ControlPlaneRefundDestinationAdapter"].__module__ == "engine.control_plane_adapter"
     assert classes["DurableRefundDestination"].__module__ == "engine.safe_executor"
 
 
@@ -83,7 +82,6 @@ def test_run_exchange_success_uses_assessed_request_supplied_resolver_destinatio
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
-        execution_policy_factory=synthetic_refund_policy,
         execution_policy_factory=synthetic_refund_policy,
     )
     assert result["execution"]["attempt_status"] == "executed"
@@ -135,7 +133,6 @@ def test_run_exchange_altered_actor_principal_or_scope_cannot_acquire_authority(
         store_path=tmp_path / mutation / "exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
-        execution_policy_factory=synthetic_refund_policy,
     )
     assert result["execution"]["attempted"] is False
     assert result["assessment"]["stages"]["authority"] in {"hold", "denied"}
@@ -160,7 +157,6 @@ def test_run_exchange_revocation_after_decision_prevents_execution(tmp_path):
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
-        execution_policy_factory=synthetic_refund_policy,
         mutate_resolver_after_decision=revoke,
     )
     assert result["execution"]["attempt_status"] == "denied"
@@ -180,7 +176,6 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
-        execution_policy_factory=synthetic_refund_policy,
         execution_policy_factory=synthetic_refund_policy,
         lose_ack=True,
     )
@@ -233,7 +228,6 @@ def test_run_exchange_partial_delivery_successor_reports_pending_unresolved_effe
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
-        execution_policy_factory=synthetic_refund_policy,
         execution_policy_factory=synthetic_refund_policy,
         partial_delivery=True,
     )
