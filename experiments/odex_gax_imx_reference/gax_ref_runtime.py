@@ -215,6 +215,124 @@ def _pipeline(manifest: dict[str, Any], cp_record: dict[str, Any], proposal: dic
     return {"reconstruction": reconstructed, "reconstruction_bundle": bundle, "odes_reference": odes, "successor_packet": successor, "execution_facts": facts}
 
 
+def _artifact_commitments(artifacts: dict[str, Any]) -> dict[str, str | None]:
+    return {
+        "reconstruction_bundle": digest(artifacts["reconstruction_bundle"]),
+        "odes_reference": digest(artifacts["odes_reference"]),
+        "successor_packet": (
+            digest(artifacts["successor_packet"])
+            if artifacts.get("successor_packet") is not None
+            else None
+        ),
+    }
+
+
+def build_gax_result_export(
+    message: dict[str, Any],
+    artifacts: dict[str, Any],
+    *,
+    lineage_kind: str = "original",
+    source_checkpoint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the durable GAX result export returned through transport."""
+    if lineage_kind not in {"original", "regenerated_derivative"}:
+        raise ValueError("unsupported GAX result lineage kind")
+    reconstruction = copy.deepcopy(artifacts["reconstruction_bundle"])
+    odes_reference = copy.deepcopy(artifacts["odes_reference"])
+    successor = copy.deepcopy(artifacts.get("successor_packet"))
+    result = _asdict(artifacts.get("result"))
+    decision = _asdict(artifacts.get("decision"))
+    moltbot = copy.deepcopy(artifacts.get("moltbot_record"))
+    producer_profile = (moltbot or {}).get("producer_profile")
+    export = {
+        "export_version": GAX_RESULT_EXPORT_VERSION,
+        "retention_state": (
+            "complete_original"
+            if lineage_kind == "original"
+            else "complete_regenerated_derivative"
+        ),
+        "message_id": message["message_id"],
+        "message_digest": message["message_digest"],
+        "conversation_id": message["conversation_id"],
+        "artifacts": {
+            "reconstruction_bundle": reconstruction,
+            "odes_reference": odes_reference,
+            "successor_packet": successor,
+        },
+        "producer_refs": {
+            "decision_id": result.get("decision_id") or decision.get("decision_id"),
+            "effect_id": result.get("effect_id") or decision.get("effect_id"),
+            "executor_attempt_id": result.get("attempt_id"),
+            "reconstruction_bundle_id": reconstruction.get("bundle_id"),
+            "odes_package_digest": (
+                odes_reference.get("odes_package", {}).get("package_digest")
+            ),
+            "successor_packet_id": (
+                successor.get("packet_id") if isinstance(successor, dict) else None
+            ),
+            "executor_producer_profile": copy.deepcopy(producer_profile),
+        },
+        "artifact_commitments": _artifact_commitments(
+            {
+                "reconstruction_bundle": reconstruction,
+                "odes_reference": odes_reference,
+                "successor_packet": successor,
+            }
+        ),
+        "lineage": {
+            "kind": lineage_kind,
+            "source_checkpoint": copy.deepcopy(source_checkpoint),
+            "replacement_effect_executed_for_regeneration": False,
+        },
+    }
+    validate_gax_result_export(export)
+    return export
+
+
+def validate_gax_result_export(export: dict[str, Any]) -> None:
+    if export.get("export_version") != GAX_RESULT_EXPORT_VERSION:
+        raise ValueError("unsupported GAX result export version")
+    artifacts = export.get("artifacts")
+    refs = export.get("producer_refs")
+    commitments = export.get("artifact_commitments")
+    if not isinstance(artifacts, dict) or not isinstance(refs, dict) or not isinstance(commitments, dict):
+        raise ValueError("incomplete GAX result export")
+    reconstruction = artifacts.get("reconstruction_bundle")
+    odes_reference = artifacts.get("odes_reference")
+    successor = artifacts.get("successor_packet")
+    if not isinstance(reconstruction, dict) or not isinstance(odes_reference, dict):
+        raise ValueError("GAX result export lacks required evidence artifacts")
+    expected = _artifact_commitments(artifacts)
+    if expected != commitments:
+        raise ValueError("GAX result artifact commitment mismatch")
+    if refs.get("reconstruction_bundle_id") != reconstruction.get("bundle_id"):
+        raise ValueError("GAX result reconstruction identity mismatch")
+    package_digest = odes_reference.get("odes_package", {}).get("package_digest")
+    if refs.get("odes_package_digest") != package_digest:
+        raise ValueError("GAX result ODES identity mismatch")
+    successor_id = successor.get("packet_id") if isinstance(successor, dict) else None
+    if refs.get("successor_packet_id") != successor_id:
+        raise ValueError("GAX result successor identity mismatch")
+    profile = refs.get("executor_producer_profile")
+    if profile is not None:
+        if profile.get("profile_version") != EXECUTOR_PRODUCER_PROFILE_VERSION:
+            raise ValueError("unsupported executor producer profile in GAX result")
+        if profile.get("repository_revision") != MOLTBOT_REVISION:
+            raise ValueError("executor producer repository revision mismatch")
+
+
+def artifacts_from_gax_result_export(export: dict[str, Any]) -> dict[str, Any]:
+    validate_gax_result_export(export)
+    artifacts = export["artifacts"]
+    odes_reference = copy.deepcopy(artifacts["odes_reference"])
+    return {
+        "reconstruction_bundle": copy.deepcopy(artifacts["reconstruction_bundle"]),
+        "odes_reference": odes_reference,
+        "successor_packet": copy.deepcopy(artifacts.get("successor_packet")),
+        "execution_facts": _artifact_facts(odes_reference),
+    }
+
+
 def execution_facts(bundle: dict[str, Any]) -> dict[str, Any]:
     return dict(export_odes_reference(_manifest(), bundle)["odes_package"].get("provenance", {}).get("execution_facts", {}))
 
@@ -285,7 +403,17 @@ def _validate_bound_association(association: dict[str, Any]) -> str | None:
     return None
 
 
-def _execution_response(assessment: dict[str, Any], status: str, result: Any, decision: Any, artifacts: dict[str, Any], *, attempted_override: bool | None = None, newly_executed_override: bool | None = None) -> dict[str, Any]:
+def _execution_response(
+    assessment: dict[str, Any],
+    status: str,
+    result: Any,
+    decision: Any,
+    artifacts: dict[str, Any],
+    *,
+    result_export: dict[str, Any] | None = None,
+    attempted_override: bool | None = None,
+    newly_executed_override: bool | None = None,
+) -> dict[str, Any]:
     assessment["stages"]["authority"] = "authorized" if status in {"executed", "unknown", "partial", "reconciled", "observed"} else status
     attempted = bool(getattr(result, "attempted", status == "executed"))
     newly_executed = bool(getattr(result, "newly_executed", False))
@@ -293,7 +421,7 @@ def _execution_response(assessment: dict[str, Any], status: str, result: Any, de
         attempted = attempted_override
     if newly_executed_override is not None:
         newly_executed = newly_executed_override
-    return {
+    response = {
         "assessment": assessment,
         "execution": {
             "attempted": attempted,
@@ -309,48 +437,170 @@ def _execution_response(assessment: dict[str, Any], status: str, result: Any, de
         "successor_packet": artifacts["successor_packet"],
         "execution_facts": artifacts["execution_facts"],
     }
+    if result_export is not None:
+        response["gax_result_export"] = copy.deepcopy(result_export)
+    return response
 
 
-def _artifacts_from_association(manifest: dict[str, Any], message: dict[str, Any], association: dict[str, Any]) -> dict[str, Any]:
-    return _pipeline(manifest, association["cp_record"], association["proposal"], association.get("moltbot"), predecessor=message)
-
-
-def _duplicate_redelivery_result(message: dict[str, Any], assessment: dict[str, Any], manifest: dict[str, Any], association: dict[str, Any]) -> dict[str, Any]:
+def _duplicate_redelivery_result(
+    message: dict[str, Any],
+    assessment: dict[str, Any],
+    association: dict[str, Any],
+    result_export: dict[str, Any] | None,
+) -> dict[str, Any]:
     problem = _validate_bound_association(association)
     if problem:
         assessment["errors"].append("GAX-EXECUTION-STORED-WORKFLOW-INTEGRITY-FAILED")
-        return {"assessment": assessment, "execution": {"attempted": False, "reason": problem, "attempt_status": "unresolved_duplicate"}, "successor_packet": None}
-    artifacts = _artifacts_from_association(manifest, message, association)
+        return {
+            "assessment": assessment,
+            "execution": {
+                "attempted": False,
+                "reason": problem,
+                "attempt_status": "unresolved_duplicate",
+            },
+            "successor_packet": None,
+        }
+    if result_export is None:
+        assessment["errors"].append("GAX-RESULT-ARTIFACTS-LEGACY-UNAVAILABLE")
+        result_data = association.get("result") or {}
+        return {
+            "assessment": assessment,
+            "execution": {
+                "attempted": False,
+                "reason": "legacy_workflow_artifacts_unavailable",
+                "attempt_status": association.get("status") or result_data.get("status") or "unresolved",
+                "newly_executed": False,
+                "effect_id": association.get("effect_id"),
+                "decision_id": association.get("decision_id"),
+                "attempt_id": association.get("attempt_id"),
+            },
+            "artifact_retention_state": "legacy_unavailable",
+            "gax_result_export": None,
+            "successor_packet": None,
+        }
+    artifacts = artifacts_from_gax_result_export(result_export)
     result_data = association.get("result") or {}
     status = association.get("status") or result_data.get("status") or "unresolved"
     if status == "executed":
         status = "reconciled"
     result = Obj({**result_data, "status": status, "newly_executed": False}) if result_data else None
-    decision = Obj({"decision_id": association.get("decision_id"), "effect_id": association.get("effect_id")})
-    return _execution_response(assessment, status, result, decision, artifacts, attempted_override=False, newly_executed_override=False)
+    decision = Obj({
+        "decision_id": association.get("decision_id"),
+        "effect_id": association.get("effect_id"),
+    })
+    return _execution_response(
+        assessment,
+        status,
+        result,
+        decision,
+        artifacts,
+        result_export=result_export,
+        attempted_override=False,
+        newly_executed_override=False,
+    )
 
 
-def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], manifest: dict[str, Any], store: "TransactionalExchangeStore", checkpoint: dict[str, Any], destination: Any | None) -> dict[str, Any]:
+def _recover_checkpoint(
+    message: dict[str, Any],
+    assessment: dict[str, Any],
+    manifest: dict[str, Any],
+    store: "TransactionalExchangeStore",
+    checkpoint: dict[str, Any],
+    destination: Any | None,
+) -> dict[str, Any]:
     problem = _validate_bound_association(checkpoint)
     if problem:
         assessment["errors"].append("GAX-EXECUTION-CHECKPOINT-INTEGRITY-FAILED")
-        return {"assessment": assessment, "execution": {"attempted": False, "reason": problem, "attempt_status": "hold"}, "successor_packet": None}
+        return {
+            "assessment": assessment,
+            "execution": {
+                "attempted": False,
+                "reason": problem,
+                "attempt_status": "hold",
+            },
+            "successor_packet": None,
+        }
     if checkpoint.get("moltbot") and checkpoint.get("result"):
-        artifacts = _artifacts_from_association(manifest, message, checkpoint)
-        store.record_workflow(message, {"proposal_record": checkpoint["proposal"], "decision": checkpoint["decision"], "request": checkpoint.get("request"), "result": checkpoint.get("result"), "status": checkpoint.get("status") or checkpoint["result"].get("status"), "cp_record": checkpoint["cp_record"], "moltbot_record": checkpoint.get("moltbot")})
-        status = checkpoint.get("status") or checkpoint["result"].get("status") or "reconciled"
+        artifacts = _pipeline(
+            manifest,
+            checkpoint["cp_record"],
+            checkpoint["proposal"],
+            checkpoint.get("moltbot"),
+            predecessor=message,
+        )
+        recovered = {
+            "proposal_record": checkpoint["proposal"],
+            "decision": checkpoint["decision"],
+            "request": checkpoint.get("request"),
+            "result": checkpoint.get("result"),
+            "status": checkpoint.get("status") or checkpoint["result"].get("status"),
+            "cp_record": checkpoint["cp_record"],
+            "moltbot_record": checkpoint.get("moltbot"),
+            **artifacts,
+        }
+        source = {
+            "message_id": message["message_id"],
+            "decision_id": checkpoint.get("decision_id"),
+            "effect_id": checkpoint.get("effect_id"),
+            "attempt_id": checkpoint.get("attempt_id"),
+            "checkpoint_state": checkpoint.get("state"),
+        }
+        store.record_workflow(
+            message,
+            recovered,
+            lineage_kind="regenerated_derivative",
+            source_checkpoint=source,
+        )
+        result_export = store.artifact_export_for_message(message)
+        status = recovered.get("status") or checkpoint["result"].get("status") or "reconciled"
         if status == "executed":
             status = "reconciled"
         result = Obj({**checkpoint["result"], "status": status, "newly_executed": False})
-        decision = Obj({"decision_id": checkpoint.get("decision_id"), "effect_id": checkpoint.get("effect_id")})
-        return _execution_response(assessment, status, result, decision, artifacts, attempted_override=False, newly_executed_override=False)
+        decision = Obj({
+            "decision_id": checkpoint.get("decision_id"),
+            "effect_id": checkpoint.get("effect_id"),
+        })
+        return _execution_response(
+            assessment,
+            status,
+            result,
+            decision,
+            artifacts_from_gax_result_export(result_export),
+            result_export=result_export,
+            attempted_override=False,
+            newly_executed_override=False,
+        )
     if destination is not None:
         rows = [r for r in _effect_rows(destination) if r.get("effect_id") == checkpoint.get("effect_id")]
         if rows:
-            assessment["errors"].append("GAX-EXECUTION-CHECKPOINT-DESTINATION-OBSERVED-WITHOUT-RETAINED-ATTEMPT")
-            return {"assessment": assessment, "execution": {"attempted": False, "reason": "destination_observed_without_replayable_attempt", "attempt_status": "hold", "effect_id": checkpoint.get("effect_id"), "decision_id": checkpoint.get("decision_id")}, "successor_packet": None}
+            assessment["errors"].append(
+                "GAX-EXECUTION-CHECKPOINT-DESTINATION-OBSERVED-WITHOUT-RETAINED-ATTEMPT"
+            )
+            return {
+                "assessment": assessment,
+                "execution": {
+                    "attempted": False,
+                    "reason": "destination_observed_without_replayable_attempt",
+                    "attempt_status": "hold",
+                    "effect_id": checkpoint.get("effect_id"),
+                    "decision_id": checkpoint.get("decision_id"),
+                },
+                "artifact_retention_state": "incomplete_no_regenerable_attempt",
+                "successor_packet": None,
+            }
     assessment["errors"].append("GAX-EXECUTION-CHECKPOINT-UNRESOLVED")
-    return {"assessment": assessment, "execution": {"attempted": False, "reason": "checkpoint_without_dispatch_evidence", "attempt_status": "hold", "effect_id": checkpoint.get("effect_id"), "decision_id": checkpoint.get("decision_id")}, "successor_packet": None}
+    return {
+        "assessment": assessment,
+        "execution": {
+            "attempted": False,
+            "reason": "checkpoint_without_dispatch_evidence",
+            "attempt_status": "hold",
+            "effect_id": checkpoint.get("effect_id"),
+            "decision_id": checkpoint.get("decision_id"),
+        },
+        "artifact_retention_state": "incomplete_checkpoint",
+        "successor_packet": None,
+    }
 
 
 def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], manifest: dict[str, Any], destination: Any, store_path: Path, resolver: Any, evaluation_time: str, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, store: "TransactionalExchangeStore" | None = None, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
@@ -420,7 +670,12 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
 
     association = store.workflow_for_message(message)
     if duplicate and association is not None:
-        return _duplicate_redelivery_result(message, assessment, manifest, association)
+        return _duplicate_redelivery_result(
+            message,
+            assessment,
+            association,
+            store.artifact_export_for_message(message),
+        )
     checkpoint = store.checkpoint_for_message(message)
     if duplicate and checkpoint is not None:
         return _recover_checkpoint(message, assessment, manifest, store, checkpoint, destination)
@@ -438,11 +693,19 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
     result = artifacts.get("result")
     status = artifacts["status"]
     if artifacts.get("fault") == "after_dispatch_before_workflow_persistence":
-        return {"assessment": assessment, "execution": {"attempted": True, "attempt_status": "interrupted_after_dispatch", "newly_executed": getattr(result, "newly_executed", False), "effect_id": getattr(result, "effect_id", None), "decision_id": getattr(result, "decision_id", None), "attempt_id": getattr(result, "attempt_id", None), "reason": artifacts["fault"]}, "successor_packet": None}
+        return {"assessment": assessment, "execution": {"attempted": True, "attempt_status": "interrupted_after_dispatch", "newly_executed": getattr(result, "newly_executed", False), "effect_id": getattr(result, "effect_id", None), "decision_id": getattr(result, "decision_id", None), "attempt_id": getattr(result, "attempt_id", None), "reason": artifacts["fault"]}, "artifact_retention_state": "incomplete_before_artifact_persistence", "successor_packet": None}
     if artifacts.get("fault") == "replay_odes_export_failed_after_dispatch":
-        return {"assessment": assessment, "execution": {"attempted": True, "attempt_status": "evidence_export_failed", "newly_executed": getattr(result, "newly_executed", False), "effect_id": getattr(result, "effect_id", None), "decision_id": getattr(result, "decision_id", None), "attempt_id": getattr(result, "attempt_id", None), "reason": artifacts["fault"]}, "successor_packet": None}
+        return {"assessment": assessment, "execution": {"attempted": True, "attempt_status": "evidence_export_failed", "newly_executed": getattr(result, "newly_executed", False), "effect_id": getattr(result, "effect_id", None), "decision_id": getattr(result, "decision_id", None), "attempt_id": getattr(result, "attempt_id", None), "reason": artifacts["fault"]}, "artifact_retention_state": "evidence_export_failed", "successor_packet": None}
     store.record_workflow(message, artifacts)
-    return _execution_response(assessment, status, result, artifacts["decision"], artifacts)
+    result_export = store.artifact_export_for_message(message)
+    return _execution_response(
+        assessment,
+        status,
+        result,
+        artifacts["decision"],
+        artifacts_from_gax_result_export(result_export),
+        result_export=result_export,
+    )
 
 
 class TransactionalExchangeStore:
