@@ -24,10 +24,10 @@ parse_time = base.parse_time
 runtime_proposal_model = base.runtime_proposal_model
 
 CP_REVISION = "283500652d47a692fb0b99a1172a6d5faffbd9a7"
-MOLTBOT_REVISION = "054e92d12ccb0bc756ca6652f39fc13b51e05d9b"  # proposed dependency head
+MOLTBOT_REVISION = "1d308faf664c504b6e310db3c7a310153ef7b067"  # accepted dependency
 MANIFEST_REVISION = "46c950bed37fe3812000895430bc0312d29e37ce"
 REPLAY_REVISION = "710ceb5667762a5e8f3a7b02e14c40eb8e1a9379"  # proposed dependency head
-ODES_REVISION = "b3a2f1e72df88cd24d93d1b7d69963f43139e749"
+ODES_REVISION = "aa7c53d3ad8c1d0b9c42620e9c8e2b99cd203873"  # proposed consumer dependency
 ALVORADA_REVISION = "fb3d97938969a89e149e8ff8db2756091d1233fc"
 MOLTBOT_PRODUCER_PROFILE_ID = "urn:cognous:profiles:moltbot-safe-executor-producer"
 MOLTBOT_PRODUCER_PROFILE_VERSION = "1.0.0"
@@ -196,7 +196,14 @@ def _pipeline(manifest: dict[str, Any], cp_record: dict[str, Any], proposal: dic
     successor = None
     if predecessor is not None:
         successor = make_successor_packet(predecessor, facts=facts, state_version=state_version, current_bundle=bundle, predecessor_packet_id=predecessor_packet_id)
-    return {"reconstruction": reconstructed, "reconstruction_bundle": bundle, "odes_reference": odes, "successor_packet": successor, "execution_facts": facts}
+    return {
+        "reconstruction": reconstructed,
+        "reconstruction_bundle": bundle,
+        "odes_reference": odes,
+        "successor_packet": successor,
+        "execution_facts": facts,
+        "producer_identity_refs": _producer_identity_refs(moltbot),
+    }
 
 
 def execution_facts(bundle: dict[str, Any]) -> dict[str, Any]:
@@ -270,6 +277,34 @@ def _validate_bound_association(association: dict[str, Any]) -> str | None:
     return None
 
 
+def _producer_identity_refs(moltbot: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(moltbot, dict):
+        return {}
+    envelope = moltbot.get("execution_envelope") or {}
+    result = moltbot.get("execution_result") or {}
+    attempt_identity = moltbot.get("attempt_identity")
+    executor_attempt_ids = [
+        row.get("attempt_id")
+        for row in (moltbot.get("attempts") or [])
+        if isinstance(row, dict) and row.get("attempt_id")
+    ]
+    control_plane_attempt_ids = [
+        row.get("attempt_id")
+        for row in (moltbot.get("control_plane_attempts") or [])
+        if isinstance(row, dict) and row.get("attempt_id")
+    ]
+    refs = {
+        "decision_id": result.get("decision_id") or envelope.get("decision_id"),
+        "effect_id": result.get("effect_id") or envelope.get("effect_id"),
+        "attempt_identity": json.loads(_json_dumps(attempt_identity)) if isinstance(attempt_identity, dict) else None,
+        "executor_attempt_ids": executor_attempt_ids,
+        "control_plane_attempt_ids": control_plane_attempt_ids,
+        "executor_producer_profile": json.loads(_json_dumps(moltbot.get("producer_profile"))) if isinstance(moltbot.get("producer_profile"), dict) else None,
+        "executor_repository": json.loads(_json_dumps(moltbot.get("repository"))) if isinstance(moltbot.get("repository"), dict) else None,
+    }
+    return {k: v for k, v in refs.items() if v not in (None, [], {})}
+
+
 def _retained_artifact_export(
     artifacts: dict[str, Any],
     *,
@@ -285,6 +320,7 @@ def _retained_artifact_export(
     }
     successor = json.loads(_json_dumps(artifacts.get("successor_packet"))) if artifacts.get("successor_packet") is not None else None
     refs = {
+        **json.loads(_json_dumps(artifacts.get("producer_identity_refs") or {})),
         "reconstruction_bundle_id": reconstruction.get("bundle_id"),
         "reconstruction_digest": digest(reconstruction),
         "odes_package_digest": digest(odes_retained["odes_package"]) if odes_retained["odes_package"] is not None else None,
@@ -294,6 +330,12 @@ def _retained_artifact_export(
             successor.get("packet_digest") if isinstance(successor, dict) else None
         ),
     }
+    commitments = {
+        "reconstruction_bundle": refs.get("reconstruction_digest"),
+        "odes_package": refs.get("odes_package_digest"),
+        "recipient_validation": refs.get("odes_validation_digest"),
+        "successor_packet": refs.get("successor_packet_digest"),
+    }
     return {
         "export_profile": GAX_ARTIFACT_EXPORT_PROFILE,
         "export_version": GAX_ARTIFACT_EXPORT_VERSION,
@@ -302,6 +344,7 @@ def _retained_artifact_export(
         "odes": odes_retained,
         "successor_packet": successor,
         "producer_refs": refs,
+        "content_commitments": {k: v for k, v in commitments.items() if v is not None},
         "lineage": json.loads(_json_dumps(lineage or {"relationship": "original"})),
     }
 
@@ -315,18 +358,25 @@ def _validate_retained_artifact_export(value: dict[str, Any]) -> str | None:
     odes = value.get("odes") or {}
     successor = value.get("successor_packet")
     refs = value.get("producer_refs") or {}
+    commitments = value.get("content_commitments") or {}
     if not isinstance(reconstruction, dict):
         return "retained_reconstruction_missing"
     if refs.get("reconstruction_bundle_id") != reconstruction.get("bundle_id"):
         return "retained_reconstruction_identity_mismatch"
     if refs.get("reconstruction_digest") != digest(reconstruction):
         return "retained_reconstruction_digest_mismatch"
+    if commitments.get("reconstruction_bundle") != refs.get("reconstruction_digest"):
+        return "retained_reconstruction_commitment_mismatch"
     package = odes.get("odes_package")
     validation = odes.get("recipient_validation")
     if package is not None and refs.get("odes_package_digest") != digest(package):
         return "retained_odes_package_digest_mismatch"
+    if package is not None and commitments.get("odes_package") != refs.get("odes_package_digest"):
+        return "retained_odes_package_commitment_mismatch"
     if validation is not None and refs.get("odes_validation_digest") != digest(validation):
         return "retained_odes_validation_digest_mismatch"
+    if validation is not None and commitments.get("recipient_validation") != refs.get("odes_validation_digest"):
+        return "retained_odes_validation_commitment_mismatch"
     if successor is not None:
         if refs.get("successor_packet_id") != successor.get("packet_id"):
             return "retained_successor_identity_mismatch"
@@ -334,6 +384,8 @@ def _validate_retained_artifact_export(value: dict[str, Any]) -> str | None:
             return "retained_successor_digest_mismatch"
         if successor.get("packet_digest") != digest({k: v for k, v in successor.items() if k != "packet_digest"}):
             return "retained_successor_content_digest_mismatch"
+        if commitments.get("successor_packet") != refs.get("successor_packet_digest"):
+            return "retained_successor_commitment_mismatch"
     return None
 
 
@@ -449,6 +501,10 @@ def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], man
                 "effect_reexecution": False,
             },
         )
+        result_status = (checkpoint.get("result") or {}).get("status")
+        status = result_status or checkpoint.get("status") or "reconciled"
+        if status in {"executed", "dispatched", "bound"}:
+            status = "reconciled"
         store.record_workflow(
             message,
             {
@@ -456,15 +512,12 @@ def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], man
                 "decision": checkpoint["decision"],
                 "request": checkpoint.get("request"),
                 "result": checkpoint.get("result"),
-                "status": checkpoint.get("status") or checkpoint["result"].get("status"),
+                "status": status,
                 "cp_record": checkpoint["cp_record"],
                 "moltbot_record": checkpoint.get("moltbot"),
                 **pipe,
             },
         )
-        status = checkpoint.get("status") or checkpoint["result"].get("status") or "reconciled"
-        if status == "executed":
-            status = "reconciled"
         result = Obj({**checkpoint["result"], "status": status, "newly_executed": False})
         decision = Obj({"decision_id": checkpoint.get("decision_id"), "effect_id": checkpoint.get("effect_id")})
         return _execution_response(
