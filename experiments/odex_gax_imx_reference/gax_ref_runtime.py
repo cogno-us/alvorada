@@ -718,6 +718,7 @@ class TransactionalExchangeStore:
                 CREATE TABLE IF NOT EXISTS messages(message_id TEXT PRIMARY KEY, message_digest TEXT NOT NULL, conversation_id TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS message_workflows(message_id TEXT PRIMARY KEY,message_digest TEXT NOT NULL,conversation_id TEXT NOT NULL,status TEXT NOT NULL,proposal_commitment TEXT,decision_id TEXT,effect_id TEXT,attempt_id TEXT,proposal_json TEXT NOT NULL,decision_json TEXT NOT NULL,request_json TEXT,result_json TEXT,cp_record_json TEXT NOT NULL,moltbot_json TEXT);
                 CREATE TABLE IF NOT EXISTS dispatch_checkpoints(message_id TEXT PRIMARY KEY,message_digest TEXT NOT NULL,conversation_id TEXT NOT NULL,state TEXT NOT NULL,proposal_commitment TEXT,decision_id TEXT,effect_id TEXT,attempt_id TEXT,proposal_json TEXT NOT NULL,decision_json TEXT NOT NULL,request_json TEXT,result_json TEXT,cp_record_json TEXT NOT NULL,moltbot_json TEXT,faults_json TEXT);
+                CREATE TABLE IF NOT EXISTS workflow_artifacts(message_id TEXT PRIMARY KEY,message_digest TEXT NOT NULL,conversation_id TEXT NOT NULL,export_version TEXT NOT NULL,retention_state TEXT NOT NULL,export_commitment TEXT NOT NULL,export_json TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS lineage(packet_id TEXT PRIMARY KEY, packet_digest TEXT NOT NULL, conversation_id TEXT NOT NULL, parent_packet_id TEXT, state_version INTEGER NOT NULL, source_packet_id TEXT NOT NULL, source_commitment TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS heads(conversation_id TEXT PRIMARY KEY, packet_id TEXT NOT NULL, packet_digest TEXT NOT NULL, state_version INTEGER NOT NULL);
                 """
@@ -794,7 +795,14 @@ class TransactionalExchangeStore:
             conn.execute("COMMIT")
             return already
 
-    def record_workflow(self, message: dict[str, Any], artifacts: dict[str, Any]) -> None:
+    def record_workflow(
+        self,
+        message: dict[str, Any],
+        artifacts: dict[str, Any],
+        *,
+        lineage_kind: str = "original",
+        source_checkpoint: dict[str, Any] | None = None,
+    ) -> None:
         proposal = artifacts["proposal_record"]
         decision = _asdict(artifacts.get("decision"))
         request = _asdict(artifacts.get("request")) if artifacts.get("request") is not None else None
@@ -804,13 +812,60 @@ class TransactionalExchangeStore:
         effect_id = (result or {}).get("effect_id") or decision.get("effect_id")
         attempt_id = (result or {}).get("attempt_id")
         proposal_commitment = (request or {}).get("operation", {}).get("proposal_commitment")
+        result_export = build_gax_result_export(
+            message,
+            artifacts,
+            lineage_kind=lineage_kind,
+            source_checkpoint=source_checkpoint,
+        )
+        encoded_export = _json_dumps(result_export)
+        export_commitment = digest(result_export)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT message_digest FROM messages WHERE message_id=?", (message["message_id"],)).fetchone()
+            row = conn.execute(
+                "SELECT message_digest FROM messages WHERE message_id=?",
+                (message["message_id"],),
+            ).fetchone()
             if row is None or row["message_digest"] != message["message_digest"]:
                 conn.execute("ROLLBACK")
                 raise RuntimeError("message receipt must be recorded before workflow association")
-            conn.execute("""INSERT OR REPLACE INTO message_workflows(message_id,message_digest,conversation_id,status,proposal_commitment,decision_id,effect_id,attempt_id,proposal_json,decision_json,request_json,result_json,cp_record_json,moltbot_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (message["message_id"], message["message_digest"], message["conversation_id"], status, proposal_commitment, decision_id, effect_id, attempt_id, _json_dumps(proposal), _json_dumps(decision), _json_dumps(request) if request is not None else None, _json_dumps(result) if result is not None else None, _json_dumps(artifacts["cp_record"]), _json_dumps(artifacts.get("moltbot_record")) if artifacts.get("moltbot_record") is not None else None))
+            prior = conn.execute(
+                "SELECT export_commitment,export_json FROM workflow_artifacts WHERE message_id=?",
+                (message["message_id"],),
+            ).fetchone()
+            if prior is not None:
+                if prior["export_commitment"] != export_commitment or prior["export_json"] != encoded_export:
+                    conn.execute("ROLLBACK")
+                    raise RuntimeError("retained GAX result export cannot be replaced")
+                conn.execute("COMMIT")
+                return
+            conn.execute(
+                """INSERT INTO message_workflows(
+                    message_id,message_digest,conversation_id,status,proposal_commitment,
+                    decision_id,effect_id,attempt_id,proposal_json,decision_json,
+                    request_json,result_json,cp_record_json,moltbot_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    message["message_id"], message["message_digest"], message["conversation_id"],
+                    status, proposal_commitment, decision_id, effect_id, attempt_id,
+                    _json_dumps(proposal), _json_dumps(decision),
+                    _json_dumps(request) if request is not None else None,
+                    _json_dumps(result) if result is not None else None,
+                    _json_dumps(artifacts["cp_record"]),
+                    _json_dumps(artifacts.get("moltbot_record")) if artifacts.get("moltbot_record") is not None else None,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO workflow_artifacts(
+                    message_id,message_digest,conversation_id,export_version,
+                    retention_state,export_commitment,export_json
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    message["message_id"], message["message_digest"], message["conversation_id"],
+                    result_export["export_version"], result_export["retention_state"],
+                    export_commitment, encoded_export,
+                ),
+            )
             conn.execute("COMMIT")
 
     def workflow_for_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -819,6 +874,27 @@ class TransactionalExchangeStore:
         if row is None or row["message_digest"] != message["message_digest"] or row["conversation_id"] != message["conversation_id"]:
             return None
         return self._association_payload(row)
+
+    def artifact_export_for_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM workflow_artifacts WHERE message_id=?",
+                (message["message_id"],),
+            ).fetchone()
+        if row is None:
+            return None
+        if (
+            row["message_digest"] != message["message_digest"]
+            or row["conversation_id"] != message["conversation_id"]
+        ):
+            raise RuntimeError("retained GAX result export message binding mismatch")
+        export = _json_loads(row["export_json"])
+        if row["export_version"] != GAX_RESULT_EXPORT_VERSION:
+            raise RuntimeError("unsupported retained GAX result export version")
+        if row["export_commitment"] != digest(export):
+            raise RuntimeError("retained GAX result export commitment mismatch")
+        validate_gax_result_export(export)
+        return export
 
     @staticmethod
     def _material_digest(packet: dict[str, Any]) -> str:
