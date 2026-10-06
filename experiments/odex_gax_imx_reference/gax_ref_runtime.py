@@ -752,54 +752,10 @@ def load_successor_packet(packet: dict[str, Any], destination: Any, *, predecess
 
 
 def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
-    """Synthetic test fixture only; production run_exchange requires caller resolver."""
-    manifest = _manifest()
-    bundle = json.loads(Path(os.environ["UPSTREAM_REPLAY_SUCCESS_EXAMPLE"]).read_text(encoding="utf-8"))
-    proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_public_executor_runtime()
-    destination = h.DurableRefundDestination(tmp_path / "moltbot-state")
-    message = make_message(bundle)
-    store = tmp_path / "fixture-exchange.sqlite"
+    """Compatibility wrapper for the explicitly synthetic fixture module."""
+    from .synthetic_fixture import run_actual_outcome as _synthetic_run
 
-    if outcome == "hold":
-        grant = resolver.contexts[proposal.authority_context_ref]["grant"]
-        resolver.statuses[grant["grant_id"]].status = "revoked"
-        return run_exchange(message, bundle, LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"), destination, evaluation_time=EVAL, manifest=manifest, store_path=store, resolver=resolver)
-    mutate = None
-    lose_ack = outcome in {"lost_ack", "restart_reconciliation"}
-    partial = outcome == "partial"
-    if outcome == "denied_after_decision":
-        def mutate(res):
-            grant = res.contexts[proposal.authority_context_ref]["grant"]
-            res.statuses[grant["grant_id"]].status = "revoked"
-    first = run_exchange(
-        message,
-        bundle,
-        LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
-        destination,
-        evaluation_time=EVAL,
-        manifest=manifest,
-        store_path=store,
-        resolver=resolver,
-        mutate_resolver_after_decision=mutate,
-        lose_ack=lose_ack,
-        partial_delivery=partial,
-    )
-    if outcome in {"duplicate_delivery", "restart_reconciliation"}:
-        return run_exchange(
-            message,
-            bundle,
-            LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
-            destination,
-            evaluation_time=EVAL,
-            manifest=manifest,
-            store_path=store,
-            resolver=resolver,
-        )
-    if outcome not in {"success", "denied_after_decision", "lost_ack", "partial"}:
-        raise ValueError(f"unsupported outcome: {outcome}")
-    return first
+    return _synthetic_run(tmp_path, outcome)
 
 def run_demo(manifest_path: str, replay_path: str, out_path: str) -> dict[str, Any]:
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
