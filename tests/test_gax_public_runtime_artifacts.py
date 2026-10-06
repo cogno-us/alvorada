@@ -542,7 +542,7 @@ def test_retained_replay_passes_evidence_pack_and_odes_integrity_without_assuran
     assert successor["packet_digest"] == export["producer_refs"]["successor_packet_digest"]
     assert export["content_commitments"]["successor_packet"] == successor["packet_digest"]
 
-    pack = import_manifest_reconstruction(_load_env("UPSTREAM_MANIFEST_EXAMPLE"), replay)
+    pack = import_manifest_reconstruction(load_env("UPSTREAM_MANIFEST_EXAMPLE"), replay)
     report = validate_evidence_pack(pack)
     assert report.valid is True
     rendered = render_traceable_markdown(pack)
