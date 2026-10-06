@@ -232,3 +232,96 @@ def test_historical_duplicate_after_grant_expiry_does_not_renew_or_repeat_effect
     after = t.recipient_store.inbox_record(governed["message_id"])
     assert json.loads(after["producer_refs_json"]) == before_refs
     assert second["acknowledgement"]["detail"]["producer_refs"] == before_refs
+
+
+def test_transport_retains_original_gax_artifacts_and_duplicate_returns_same_export(tmp_path):
+    bundle, handler, destination = _accepted_fixture(tmp_path)
+    t = _transport_for_accepted(
+        tmp_path, handler, attempt_id="original-attempt", ack_id="original-ack"
+    )
+    governed = make_message(bundle, message_id="transport-original-artifacts")
+    t.queue(
+        governed,
+        route_id="accepted-gax-local",
+        sender_endpoint_ref="local://refund-sender",
+        now=EVAL,
+    )
+    first = t.deliver(governed["message_id"], now=EVAL)
+    assert first["transport_state"] == "DELIVERED"
+    original = t.recipient_store.result_export(governed["message_id"])
+    assert original["retention_state"] == "complete_original"
+    assert original["artifacts"]["reconstruction_bundle"]["bundle_id"] == original["producer_refs"]["reconstruction_bundle_id"]
+    assert original["artifacts"]["odes_reference"]["odes_package"]["package_digest"] == original["producer_refs"]["odes_package_digest"]
+    assert original["artifacts"]["successor_packet"]["packet_id"] == original["producer_refs"]["successor_packet_id"]
+
+    second = t.deliver(governed["message_id"], now=EVAL, force=True)
+    assert second["transport_state"] == "DELIVERED"
+    retained = t.recipient_store.result_export(governed["message_id"])
+    assert retained == original
+    assert len(_rows(destination)) == 1
+
+
+def test_transport_restart_after_effect_commit_before_outcome_persistence_recovers_original_export(tmp_path):
+    bundle, handler, destination = _accepted_fixture(tmp_path)
+    t = _transport_for_accepted(
+        tmp_path, handler, attempt_id="crash-attempt-1", ack_id="crash-ack-1"
+    )
+    governed = make_message(bundle, message_id="transport-after-handler-crash")
+    t.queue(
+        governed,
+        route_id="accepted-gax-local",
+        sender_endpoint_ref="local://refund-sender",
+        now=EVAL,
+    )
+    interrupted = t.deliver(
+        governed["message_id"],
+        now=EVAL,
+        fault_after_handler=True,
+    )
+    assert interrupted["transport_state"] == "PENDING_RETRY"
+    assert len(_rows(destination)) == 1
+    assert t.recipient_store.prior_outcome(governed["message_id"]) is None
+
+    restarted = _transport_for_accepted(
+        tmp_path, handler, attempt_id="crash-attempt-2", ack_id="crash-ack-2"
+    )
+    recovered = restarted.deliver(
+        governed["message_id"],
+        now="2026-08-08T01:00:02Z",
+        force=True,
+    )
+    assert recovered["transport_state"] == "DELIVERED"
+    retained = restarted.recipient_store.result_export(governed["message_id"])
+    assert retained["retention_state"] == "complete_original"
+    assert retained["lineage"]["kind"] == "original"
+    assert retained["lineage"]["replacement_effect_executed_for_regeneration"] is False
+    assert len(_rows(destination)) == 1
+
+
+def test_transport_result_export_commitment_substitution_is_rejected(tmp_path):
+    bundle, handler, destination = _accepted_fixture(tmp_path)
+    t = _transport_for_accepted(
+        tmp_path, handler, attempt_id="tamper-attempt", ack_id="tamper-ack"
+    )
+    governed = make_message(bundle, message_id="transport-artifact-tamper")
+    t.queue(
+        governed,
+        route_id="accepted-gax-local",
+        sender_endpoint_ref="local://refund-sender",
+        now=EVAL,
+    )
+    assert t.deliver(governed["message_id"], now=EVAL)["transport_state"] == "DELIVERED"
+    with sqlite3.connect(t.recipient_store.path) as con:
+        row = con.execute(
+            "SELECT export_json FROM recipient_result_exports WHERE message_id=?",
+            (governed["message_id"],),
+        ).fetchone()
+        altered = json.loads(row[0])
+        altered["retention_state"] = "forged"
+        con.execute(
+            "UPDATE recipient_result_exports SET export_json=? WHERE message_id=?",
+            (json.dumps(altered, sort_keys=True, separators=(",", ":")), governed["message_id"]),
+        )
+    with pytest.raises(ValueError, match="commitment mismatch"):
+        t.recipient_store.result_export(governed["message_id"])
+    assert len(_rows(destination)) == 1
