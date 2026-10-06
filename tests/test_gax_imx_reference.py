@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.executor_runtime_fixture import integrated, policy_for
+from executor_runtime_fixture import integrated, policy_for
 
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     LocalRegistry,
@@ -319,7 +319,19 @@ def test_unrelated_existing_effect_is_not_reused_when_current_operation_fails(tm
         }
     )
     other_request = h.ExecutionEnvelope(request.version, "decision-other", "effect-other", other_op)
-    other_result = h.LocalDestinationExecutor(destination, policy_for(other_op, proposal, resolver)).execute_snapshot(h.snapshot_envelope(other_request))
+    other_policy = h.LocalExecutionPolicy(
+        allowed_institutions=frozenset({other_op.institution_id}),
+        allowed_authority_domains=frozenset({other_op.authority_domain}),
+        allowed_adapters=frozenset({other_op.adapter_id}),
+        allowed_actions=frozenset({other_op.action_id}),
+        allowed_target_prefixes=(other_op.target,),
+        allowed_units=frozenset({other_op.unit}),
+        max_amount=1000.0,
+        max_effects=1,
+    )
+    other_result = h.LocalDestinationExecutor(destination, other_policy).execute_snapshot(
+        h.snapshot_envelope(other_request)
+    )
     assert other_result.status == "failed"
     assert other_result.newly_executed is False
     assert {row["effect_id"] for row in _effect_rows(destination)} == {decision.effect_id}
