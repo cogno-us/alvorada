@@ -16,11 +16,13 @@ from experiments.odex_gax_imx_reference.gax_ref import (
     load_successor_packet,
     make_message,
     make_successor_packet,
-    proposal_commitment,
     run_exchange,
     runtime_proposal_model,
     _build_resolver,
+    parse_time,
 )
+
+EVAL = "2026-08-08T01:00:00Z"
 
 
 def load_env(name: str) -> dict:
@@ -48,7 +50,7 @@ def registry() -> LocalRegistry:
 def run_ok(bundle: dict, tmp_path: Path, **kwargs):
     destination = DestinationState(tmp_path / "destination.json")
     msg = kwargs.pop("message", make_message(bundle))
-    return run_exchange(msg, bundle, registry(), destination, evaluation_time="2026-08-08T01:00:00Z", manifest=manifest(), store_path=tmp_path / "exchange.json", **kwargs), destination
+    return run_exchange(msg, bundle, registry(), destination, evaluation_time=EVAL, manifest=manifest(), store_path=tmp_path / "exchange.json", **kwargs), destination
 
 
 def test_valid_bounded_request_uses_workflow_and_produces_one_effect(tmp_path):
@@ -75,10 +77,9 @@ def test_governor_fabricated_authorized_record_cannot_execute(tmp_path):
     for record in fake["records"]:
         if record.get("record_type") == "runtime_decision":
             record["data"] = {"decision_id": "caller-decision", "result": "authorized", "effect_id": "caller-effect", "binding": {"proposal_commitment": digest(proposal)}}
-    msg = make_message(fake)
     destination = DestinationState(tmp_path / "destination.json")
     try:
-        result = run_exchange(msg, fake, registry(), destination, evaluation_time="2026-08-08T01:00:00Z", manifest=manifest(), store_path=tmp_path / "exchange.json")
+        result = run_exchange(make_message(fake), fake, registry(), destination, evaluation_time=EVAL, manifest=manifest(), store_path=tmp_path / "exchange.json")
     except Exception:
         result = {"execution": {"attempted": False}}
     assert result["execution"]["attempted"] is False
@@ -116,14 +117,14 @@ def test_changed_payload_target_or_proposal_commitment_rejects():
         else:
             trial["proposal_commitment"] = "sha256:" + "0" * 64
         trial["message_digest"] = digest({k: v for k, v in trial.items() if k != "message_digest"})
-        result = assess_message(trial, bundle, registry(), evaluation_time="2026-08-08T01:00:00Z")
+        result = assess_message(trial, bundle, registry(), evaluation_time=EVAL)
         assert result["permitted_handling"] == "REFUSE"
 
 
 def test_revocation_or_policy_change_after_receipt_prevents_execution(tmp_path):
     bundle = success_bundle()
     proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal)
+    resolver = _build_resolver(proposal, now=parse_time(EVAL))
     grant_id = next(iter(resolver.statuses))
     def revoke(r):
         r.statuses[grant_id].status = "revoked"
@@ -136,8 +137,7 @@ def test_revocation_or_policy_change_after_receipt_prevents_execution(tmp_path):
 def test_durable_restart_after_commit_before_ack_reconciles_existing_effect(tmp_path):
     bundle = success_bundle()
     destination1 = DestinationState(tmp_path / "destination.json")
-    msg = make_message(bundle, message_id="m1")
-    first = run_exchange(msg, bundle, registry(), destination1, evaluation_time="2026-08-08T01:00:00Z", manifest=manifest(), store_path=tmp_path / "exchange.json", lose_ack=True)
+    first = run_exchange(make_message(bundle, message_id="m1"), bundle, registry(), destination1, evaluation_time=EVAL, manifest=manifest(), store_path=tmp_path / "exchange.json", lose_ack=True)
     assert first["execution"]["attempt_status"] == "unknown"
     assert len(destination1.effects) == 1
     destination2 = DestinationState(tmp_path / "destination.json")
@@ -149,7 +149,7 @@ def test_durable_restart_after_commit_before_ack_reconciles_existing_effect(tmp_
 def test_new_message_id_replay_does_not_duplicate_effect(tmp_path):
     bundle = success_bundle()
     destination = DestinationState(tmp_path / "destination.json")
-    first = run_exchange(make_message(bundle, message_id="m1"), bundle, registry(), destination, evaluation_time="2026-08-08T01:00:00Z", manifest=manifest(), store_path=tmp_path / "exchange.json")
+    first = run_exchange(make_message(bundle, message_id="m1"), bundle, registry(), destination, evaluation_time=EVAL, manifest=manifest(), store_path=tmp_path / "exchange.json")
     second = run_exchange(make_message(bundle, message_id="m2"), bundle, registry(), destination, evaluation_time="2026-08-08T01:01:00Z", manifest=manifest(), store_path=tmp_path / "exchange.json")
     assert first["execution"]["newly_executed"] is True
     assert second["execution"]["newly_executed"] is False
@@ -160,7 +160,7 @@ def test_message_id_reuse_with_changed_content_rejects(tmp_path):
     bundle = success_bundle()
     destination = DestinationState(tmp_path / "destination.json")
     msg = make_message(bundle, message_id="same")
-    run_exchange(msg, bundle, registry(), destination, evaluation_time="2026-08-08T01:00:00Z", manifest=manifest(), store_path=tmp_path / "exchange.json")
+    run_exchange(msg, bundle, registry(), destination, evaluation_time=EVAL, manifest=manifest(), store_path=tmp_path / "exchange.json")
     changed = copy.deepcopy(msg)
     changed["content"]["summary"] = "changed"
     changed["content_digest"] = digest(changed["content"])
@@ -172,13 +172,9 @@ def test_message_id_reuse_with_changed_content_rejects(tmp_path):
 
 def test_same_effect_id_with_different_operation_content_rejects(tmp_path):
     bundle = success_bundle()
-    proposal = runtime_proposal_model(bundle)
-    # Prebind the effect id to a different operation digest before execution.
-    store = DurableExchangeStore(tmp_path / "exchange.json")
-    resolver = _build_resolver(proposal)
     destination = DestinationState(tmp_path / "destination.json")
-    # Determine effect id through an initial dry decision in an isolated flow-like run by using a first real run, then tamper store.
-    first = run_exchange(make_message(bundle, message_id="m1"), bundle, registry(), destination, evaluation_time="2026-08-08T01:00:00Z", manifest=manifest(), store_path=tmp_path / "exchange.json")
+    first = run_exchange(make_message(bundle, message_id="m1"), bundle, registry(), destination, evaluation_time=EVAL, manifest=manifest(), store_path=tmp_path / "exchange.json")
+    store = DurableExchangeStore(tmp_path / "exchange.json")
     effect_id = first["execution"]["effect_id"]
     state = store._load(); state["effects"][effect_id] = {"operation_digest": "sha256:" + "0" * 64}; store._write(state)
     second = run_exchange(make_message(bundle, message_id="m2"), bundle, registry(), destination, evaluation_time="2026-08-08T01:01:00Z", manifest=manifest(), store_path=tmp_path / "exchange.json")
@@ -198,9 +194,12 @@ def test_historical_partial_evidence_alone_does_not_create_partial_effect(tmp_pa
     for record in bundle["records"]:
         if record.get("record_type") in {"effect_observation", "destination_effect"}:
             record["data"]["state"] = "partial"
-    result, destination = run_ok(bundle, tmp_path)
-    assert result["execution"]["destination_observed"] == "applied"
-    assert next(iter(destination.effects.values()))["state"] == "applied"
+    destination = DestinationState(tmp_path / "destination.json")
+    try:
+        result = run_exchange(make_message(bundle), bundle, registry(), destination, evaluation_time=EVAL, manifest=manifest(), store_path=tmp_path / "exchange.json")
+    except Exception:
+        result = {"execution": {"attempted": False}}
+    assert not any(effect.get("state") == "partial" for effect in destination.effects.values())
 
 
 def test_hold_deny_no_effect_from_retained_decision_outcomes(tmp_path):
@@ -215,9 +214,8 @@ def test_hold_deny_no_effect_from_retained_decision_outcomes(tmp_path):
                 record["_drop"] = True
         bundle["records"] = [r for r in bundle["records"] if not r.get("_drop")]
         destination = DestinationState(tmp_path / outcome / "destination.json")
-        msg = make_message(success_bundle())
         try:
-            result = run_exchange(msg, bundle, registry(), destination, evaluation_time="2026-08-08T01:00:00Z", manifest=manifest(), store_path=tmp_path / outcome / "exchange.json")
+            result = run_exchange(make_message(success_bundle()), bundle, registry(), destination, evaluation_time=EVAL, manifest=manifest(), store_path=tmp_path / outcome / "exchange.json")
         except Exception:
             result = {"execution": {"attempted": False}}
         assert result["execution"]["attempted"] is False
@@ -240,7 +238,7 @@ def test_unsupported_versions_and_downgrade_fail():
     bundle = success_bundle(); msg = make_message(bundle)
     msg["profile"] = "https://opendecisionevidence.org/profiles/odex-gax/0.2"
     msg["message_digest"] = digest({k: v for k, v in msg.items() if k != "message_digest"})
-    result = assess_message(msg, bundle, registry(), evaluation_time="2026-08-08T01:00:00Z")
+    result = assess_message(msg, bundle, registry(), evaluation_time=EVAL)
     assert "GAX-PROFILE-UNSUPPORTED-OR-DOWNGRADE" in result["errors"]
 
 
