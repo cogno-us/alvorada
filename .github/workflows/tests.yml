@@ -46,29 +46,25 @@ jobs:
           ref: 1d308faf664c504b6e310db3c7a310153ef7b067
           path: upstream/moltbot-safe
 
-      # Proposed consumer dependency: this branch supports producer profile 1.0.0
-      # but still recognizes the pre-merge Moltbot feature revision; Batch 2
-      # intentionally does not modify Replay to resolve that dependency.
       - name: Checkout pinned Replay
         uses: actions/checkout@v4
         with:
           repository: cogno-us/cognous-agent-replay-bundle
-          ref: 710ceb5667762a5e8f3a7b02e14c40eb8e1a9379
+          ref: f63ce914504dd06813c4ccd199b0570dbd8dd427
           path: upstream/replay
 
       - name: Checkout pinned Evidence Pack
         uses: actions/checkout@v4
         with:
           repository: cogno-us/cognous-agent-governance-evidence-pack
-          ref: c699c1fb7c4f8057631c4e5909d11a721c2c958d
+          ref: f1a76187b72d5b7c9fded12580ba081cb9cba338
           path: upstream/evidence-pack
 
-      # Proposed ODES consumer dependency; not yet accepted on main.
       - name: Checkout pinned ODES
         uses: actions/checkout@v4
         with:
           repository: cogno-us/open-decision-evidence-standard
-          ref: aa7c53d3ad8c1d0b9c42620e9c8e2b99cd203873
+          ref: cba83a1c06f718a8afd76178f36e5cc15896347d
           path: upstream/odes
 
       - name: Verify pinned revisions
@@ -77,9 +73,9 @@ jobs:
           test "$(git -C upstream/authority-context rev-parse HEAD)" = "fb3d97938969a89e149e8ff8db2756091d1233fc"
           test "$(git -C upstream/control-plane rev-parse HEAD)" = "283500652d47a692fb0b99a1172a6d5faffbd9a7"
           test "$(git -C upstream/moltbot-safe rev-parse HEAD)" = "1d308faf664c504b6e310db3c7a310153ef7b067"
-          test "$(git -C upstream/replay rev-parse HEAD)" = "710ceb5667762a5e8f3a7b02e14c40eb8e1a9379"
-          test "$(git -C upstream/evidence-pack rev-parse HEAD)" = "c699c1fb7c4f8057631c4e5909d11a721c2c958d"
-          test "$(git -C upstream/odes rev-parse HEAD)" = "aa7c53d3ad8c1d0b9c42620e9c8e2b99cd203873"
+          test "$(git -C upstream/replay rev-parse HEAD)" = "f63ce914504dd06813c4ccd199b0570dbd8dd427"
+          test "$(git -C upstream/evidence-pack rev-parse HEAD)" = "f1a76187b72d5b7c9fded12580ba081cb9cba338"
+          test "$(git -C upstream/odes rev-parse HEAD)" = "cba83a1c06f718a8afd76178f36e5cc15896347d"
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -91,11 +87,13 @@ jobs:
           pip install -e upstream/control-plane
           pip install -e upstream/replay
           pip install -e upstream/odes
+          pip install -e upstream/evidence-pack
           pip install -e .[dev]
           python - <<'PY'
           import agent_control_plane
           import agent_replay_bundle
           import odes
+          import agent_governance_evidence_pack
           PY
 
       - name: Run tests
