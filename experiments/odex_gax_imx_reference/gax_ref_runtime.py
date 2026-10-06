@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import importlib
-import importlib.util
 import json
 import os
 import sqlite3
@@ -23,56 +22,64 @@ digest = base.digest
 make_message = base.make_message
 parse_time = base.parse_time
 runtime_proposal_model = base.runtime_proposal_model
-_build_resolver = base._build_resolver
 
 CP_REVISION = "283500652d47a692fb0b99a1172a6d5faffbd9a7"
-MOLTBOT_REVISION = "6b0ba1185bcd390f71df947dda349415e4105f5f"
+MOLTBOT_REVISION = "1af0351c18c3339b2978a33e284b59febb465426"  # proposed dependency head
 MANIFEST_REVISION = "46c950bed37fe3812000895430bc0312d29e37ce"
 REPLAY_REVISION = "f12648313cedc2cf06145d397fa56cdea18cc800"
 ODES_REVISION = "b3a2f1e72df88cd24d93d1b7d69963f43139e749"
 ALVORADA_REVISION = "fb3d97938969a89e149e8ff8db2756091d1233fc"
+MOLTBOT_PRODUCER_PROFILE_ID = "urn:cognous:profiles:moltbot-safe-executor-producer"
+MOLTBOT_PRODUCER_PROFILE_VERSION = "1.0.0"
+GAX_ARTIFACT_EXPORT_PROFILE = "urn:cognous:profiles:gax-retained-artifacts"
+GAX_ARTIFACT_EXPORT_VERSION = "1.0.0"
 
 
 def _repo_path(env_name: str, default: str) -> Path:
     return Path(os.environ.get(env_name, default)).resolve()
 
 
-def load_actual_pinned_moltbot_helpers():
+def load_executor_runtime() -> dict[str, Any]:
     cp_root = _repo_path("MOLTBOT_SAFE_CONTROL_PLANE_ROOT", "upstream/control-plane")
     molt_root = _repo_path("MOLTBOT_SAFE_ROOT", "upstream/moltbot-safe")
-    manifest_path = _repo_path(
-        "MOLTBOT_SAFE_MANIFEST_FIXTURE",
-        os.environ.get("UPSTREAM_MANIFEST_EXAMPLE", "upstream/manifest/examples/refund_integration_v1_1.manifest.json"),
-    )
-    missing = [str(p) for p in (cp_root, molt_root, manifest_path) if not p.exists()]
+    missing = [str(p) for p in (cp_root, molt_root) if not p.exists()]
     if missing:
         raise RuntimeError("pinned upstream checkout is unavailable: " + ", ".join(missing))
     for path in (str(cp_root / "src"), str(molt_root)):
         if path not in sys.path:
             sys.path.insert(0, path)
-    os.environ["MOLTBOT_SAFE_CONTROL_PLANE_ROOT"] = str(cp_root)
-    os.environ["MOLTBOT_SAFE_MANIFEST_FIXTURE"] = str(manifest_path)
-    helper_path = molt_root / "tests" / "test_safe_executor.py"
-    spec = importlib.util.spec_from_file_location("alvorada_actual_pinned_moltbot_helpers", helper_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("unable to load pinned Moltbot helper module")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+
+    producer = importlib.import_module("engine.producer_contract")
+    cp = importlib.import_module("agent_control_plane.bounded")
+    if producer.EXECUTOR_PRODUCER_PROFILE_ID != MOLTBOT_PRODUCER_PROFILE_ID:
+        raise RuntimeError("unsupported Moltbot executor producer profile id")
+    if producer.EXECUTOR_PRODUCER_PROFILE_VERSION != MOLTBOT_PRODUCER_PROFILE_VERSION:
+        raise RuntimeError("unsupported Moltbot executor producer profile version")
+    return {
+        "producer": producer,
+        "cp": cp,
+        "PinnedControlPlaneExecutor": producer.PinnedControlPlaneExecutor,
+        "DurableRefundDestination": producer.DurableRefundDestination,
+        "ExecutionEnvelope": producer.ExecutionEnvelope,
+        "ExecutionOperation": producer.ExecutionOperation,
+        "LocalExecutionPolicy": producer.LocalExecutionPolicy,
+        "commitment": producer.commitment,
+        "export_execution_artifacts": producer.export_execution_artifacts,
+    }
 
 
 def actual_executor_classes() -> dict[str, Any]:
-    h = load_actual_pinned_moltbot_helpers()
-    adapter_mod = importlib.import_module("engine.control_plane_adapter")
+    runtime = load_executor_runtime()
     return {
-        "PinnedControlPlaneExecutor": h.PinnedControlPlaneExecutor,
-        "ControlPlaneRefundDestinationAdapter": adapter_mod.ControlPlaneRefundDestinationAdapter,
-        "DurableRefundDestination": h.DurableRefundDestination,
-        "ExecutionEnvelope": h.ExecutionEnvelope,
-        "ExecutionOperation": h.ExecutionOperation,
-        "LocalExecutionPolicy": h.LocalExecutionPolicy,
+        key: runtime[key]
+        for key in (
+            "PinnedControlPlaneExecutor",
+            "DurableRefundDestination",
+            "ExecutionEnvelope",
+            "ExecutionOperation",
+            "LocalExecutionPolicy",
+        )
     }
-
 
 def _sqlite_rows(path: Path, table: str) -> list[dict[str, Any]]:
     with sqlite3.connect(path) as conn:
@@ -109,34 +116,30 @@ def _manifest() -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _export_sources(workflow: Any, proposal: Any, request: Any, result: Any, destination: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _export_sources(
+    workflow: Any,
+    proposal: Any,
+    request: Any,
+    result: Any,
+    destination: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    runtime = load_executor_runtime()
     cp_record = workflow.records.load().model_dump(mode="json")
-    all_effects = _sqlite_rows(Path(destination.path), "effects")
-    all_attempts = _sqlite_rows(Path(destination.path), "attempts")
-    all_events = _sqlite_rows(Path(destination.path), "attempt_events")
-    current_effect = request.effect_id
-    current_decision = request.decision_id
-    current_attempt_ids: set[str] = set()
-    if getattr(result, "attempt_id", None):
-        current_attempt_ids.add(str(result.attempt_id))
-    selected_attempts: list[dict[str, Any]] = []
-    for row in all_attempts:
-        if row.get("effect_id") != current_effect:
-            continue
-        if row.get("decision_id") == current_decision or row.get("attempt_id") in current_attempt_ids:
-            selected_attempts.append(row)
-            if row.get("attempt_id"):
-                current_attempt_ids.add(str(row["attempt_id"]))
-    selected_events = [row for row in all_events if row.get("attempt_id") in current_attempt_ids]
-    moltbot = {
-        "execution_envelope": dataclasses.asdict(request),
-        "execution_result": dataclasses.asdict(result),
-        "effects": [row for row in all_effects if row.get("effect_id") == current_effect],
-        "attempts": selected_attempts,
-        "attempt_events": selected_events,
-    }
-    return cp_record, proposal.model_dump(mode="json", exclude_none=False), moltbot
-
+    producer_export = runtime["export_execution_artifacts"](
+        request,
+        result,
+        destination,
+        repository_revision=MOLTBOT_REVISION,
+        source_asserted_provenance={
+            "producer": "cogno-us/moltbot-safe",
+            "consumer": "cogno-us/alvorada:gax_ref_runtime",
+        },
+    )
+    return (
+        cp_record,
+        proposal.model_dump(mode="json", exclude_none=False),
+        producer_export,
+    )
 
 def import_replay_bundle(cp_record: dict[str, Any], proposal: dict[str, Any] | None, moltbot: dict[str, Any] | None = None) -> Any:
     from agent_replay_bundle.importers import import_bounded_workflow
@@ -200,13 +203,13 @@ def execution_facts(bundle: dict[str, Any]) -> dict[str, Any]:
     return dict(export_odes_reference(_manifest(), bundle)["odes_package"].get("provenance", {}).get("execution_facts", {}))
 
 
-def _build_request_from_decision(h: Any, proposal: Any, resolver: Any, decision: Any) -> Any:
+def _build_request_from_decision(runtime: dict[str, Any], proposal: Any, resolver: Any, decision: Any) -> Any:
     context = resolver.authority_context(proposal.authority_context_ref or "")
     institution = context.get("institution") if isinstance(context, dict) else {}
     binding = decision.binding
     if binding is None:
         raise ValueError("authorized execution requires a decision authorization binding")
-    operation = h.ExecutionOperation(
+    operation = runtime["ExecutionOperation"](
         actor=proposal.actor,
         principal=proposal.principal,
         institution_id=institution["institution_id"],
@@ -214,7 +217,7 @@ def _build_request_from_decision(h: Any, proposal: Any, resolver: Any, decision:
         manifest_id=proposal.manifest_id,
         manifest_version=proposal.manifest_version,
         manifest_digest=proposal.manifest_digest,
-        proposal_commitment=h.commitment(proposal.model_dump(mode="json", exclude_none=False)),
+        proposal_commitment=runtime["commitment"](proposal.model_dump(mode="json", exclude_none=False)),
         action_id=proposal.action_id,
         adapter_id=proposal.adapter_id,
         target=proposal.target,
@@ -230,7 +233,8 @@ def _build_request_from_decision(h: Any, proposal: Any, resolver: Any, decision:
         grant_revision=binding.grant_revision,
         effective_max_effects=binding.effective_max_effects,
     )
-    return h.ExecutionEnvelope(h.EXECUTION_ENVELOPE_VERSION, decision.decision_id, decision.effect_id, operation)
+    producer = runtime["producer"]
+    return runtime["ExecutionEnvelope"](producer.EXECUTION_ENVELOPE_VERSION, decision.decision_id, decision.effect_id, operation)
 
 
 class Obj:
@@ -254,8 +258,8 @@ def _validate_bound_association(association: dict[str, Any]) -> str | None:
         return "stored_envelope_identity_mismatch"
     if result.get("decision_id") != decision_id or result.get("effect_id") != effect_id:
         return "stored_result_identity_mismatch"
-    h = load_actual_pinned_moltbot_helpers()
-    if operation.get("proposal_commitment") != h.commitment(proposal):
+    runtime = load_executor_runtime()
+    if operation.get("proposal_commitment") != runtime["commitment"](proposal):
         return "stored_operation_proposal_commitment_mismatch"
     for row in moltbot.get("effects") or []:
         if row.get("effect_id") != effect_id:
@@ -334,15 +338,15 @@ def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], man
     return {"assessment": assessment, "execution": {"attempted": False, "reason": "checkpoint_without_dispatch_evidence", "attempt_status": "hold", "effect_id": checkpoint.get("effect_id"), "decision_id": checkpoint.get("decision_id")}, "successor_packet": None}
 
 
-def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], manifest: dict[str, Any], destination: Any, store_path: Path, resolver: Any, evaluation_time: str, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, store: "TransactionalExchangeStore" | None = None, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
-    h = load_actual_pinned_moltbot_helpers()
-    helper = h._load_pinned_helpers()
+def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], manifest: dict[str, Any], destination: Any, store_path: Path, resolver: Any, evaluation_time: str, execution_policy_factory: Any, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, store: "TransactionalExchangeStore" | None = None, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
+    runtime = load_executor_runtime()
+    cp = runtime["cp"]
     now = parse_time(evaluation_time)
     proposal = runtime_proposal_model(bundle)
     record_suffix = digest({"message_id": message["message_id"], "message_digest": message.get("message_digest"), "evaluation_time": evaluation_time})[-16:]
-    record_store = helper.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}-{record_suffix}.json", proposal.run_id or "run-gax-imx")
-    cp_destination = helper.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}-{record_suffix}.json")
-    workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
+    record_store = cp.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}-{record_suffix}.json", proposal.run_id or "run-gax-imx")
+    cp_destination = cp.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}-{record_suffix}.json")
+    workflow = cp.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
     decision = workflow.decide(proposal, now=now)
     proposal_record = proposal.model_dump(mode="json", exclude_none=False)
     cp_record = record_store.load().model_dump(mode="json")
@@ -354,10 +358,17 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
     if mutate_resolver_after_decision:
         mutate_resolver_after_decision(resolver)
 
-    request = _build_request_from_decision(h, proposal, resolver, decision)
+    request = _build_request_from_decision(runtime, proposal, resolver, decision)
     if store is not None:
         store.record_dispatch_checkpoint(message, {"status": "bound", "proposal_record": proposal_record, "decision": _asdict(decision), "request": _asdict(request), "cp_record": cp_record})
-    executor = h.PinnedControlPlaneExecutor(workflow=workflow, destination=destination, policy=h.policy(request.operation))
+    policy = execution_policy_factory(request.operation)
+    if not isinstance(policy, runtime["LocalExecutionPolicy"]):
+        raise TypeError("execution_policy_factory must return LocalExecutionPolicy")
+    executor = runtime["PinnedControlPlaneExecutor"](
+        workflow=workflow,
+        destination=destination,
+        policy=policy,
+    )
     simulate = "partial" if partial_delivery else ("lost_ack" if lose_ack else None)
     result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=now, simulate=simulate)
     cp_record, p, moltbot = _export_sources(workflow, proposal, request, result, destination)
@@ -372,7 +383,7 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
     return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, "proposal_record": p, "cp_record": cp_record, "moltbot_record": moltbot, **pipe}
 
 
-def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
+def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, execution_policy_factory: Any | None = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
     store_path = Path(store_path)
     store = TransactionalExchangeStore(store_path)
     duplicate, err = store.record_message(message)
@@ -401,7 +412,10 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
         assessment["errors"].append("GAX-EXECUTION-DESTINATION-REQUIRED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "destination_required"}, "successor_packet": None}
 
-    artifacts = _run_current_request(message=message, bundle=bundle, manifest=manifest, destination=destination, store_path=store_path, resolver=resolver, evaluation_time=evaluation_time, mutate_resolver_after_decision=mutate_resolver_after_decision, lose_ack=lose_ack, partial_delivery=partial_delivery, store=store, fault_after_dispatch=fault_after_dispatch, fault_evidence_once=fault_evidence_once)
+    if execution_policy_factory is None:
+        assessment["errors"].append("GAX-EXECUTION-POLICY-REQUIRED")
+        return {"assessment": assessment, "execution": {"attempted": False, "reason": "execution_policy_factory_required"}, "successor_packet": None}
+    artifacts = _run_current_request(message=message, bundle=bundle, manifest=manifest, destination=destination, store_path=store_path, resolver=resolver, evaluation_time=evaluation_time, execution_policy_factory=execution_policy_factory, mutate_resolver_after_decision=mutate_resolver_after_decision, lose_ack=lose_ack, partial_delivery=partial_delivery, store=store, fault_after_dispatch=fault_after_dispatch, fault_evidence_once=fault_evidence_once)
     result = artifacts.get("result")
     status = artifacts["status"]
     if artifacts.get("fault") == "after_dispatch_before_workflow_persistence":
@@ -601,57 +615,83 @@ def load_successor_packet(packet: dict[str, Any], destination: Any, *, predecess
 
 
 def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
-    h = load_actual_pinned_moltbot_helpers()
-    helper = h._load_pinned_helpers()
-    manifest = helper.manifest()
-    bundle = json.loads(Path(os.environ["UPSTREAM_REPLAY_SUCCESS_EXAMPLE"]).read_text(encoding="utf-8")) if os.environ.get("UPSTREAM_REPLAY_SUCCESS_EXAMPLE") else {}
-    message = make_message(bundle) if bundle else {"message_id": "fixture-message", "conversation_id": "fixture-conversation"}
-    if outcome == "hold":
-        proposal = helper.proposal()
-        resolver = helper.resolver_for(proposal)
-        grant = resolver.contexts[helper.PROFILE]["grant"]
-        resolver.statuses[grant["grant_id"]].status = "revoked"
-        destination = helper.LocalRefundDestination(tmp_path / "cp-destination.json")
-        records = helper.BoundedRecordStore(tmp_path / "cp-run.json", "run-1")
-        workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=destination, records=records)
-        decision = workflow.decide(proposal, now=helper.NOW)
-        pipe = _pipeline(manifest, workflow.records.load().model_dump(mode="json"), proposal.model_dump(mode="json", exclude_none=False), None, predecessor=message)
-        return {"status": decision.result, "decision": decision, "destination_effects": {}, **pipe}
-    helper, proposal, resolver, workflow, decision, destination, executor, request = h._integrated(tmp_path)
-    if outcome == "success":
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "denied_after_decision":
-        grant = resolver.contexts[helper.PROFILE]["grant"]
-        resolver.statuses[grant["grant_id"]].status = "revoked"
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "lost_ack":
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="lost_ack")
-    elif outcome == "restart_reconciliation":
-        executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="lost_ack")
-        destination = h.DurableRefundDestination(destination.root)
-        executor = h.PinnedControlPlaneExecutor(workflow=workflow, destination=destination, policy=h.policy(request.operation))
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "duplicate_delivery":
-        executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "partial":
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="partial")
-    else:
-        raise ValueError(f"unsupported outcome: {outcome}")
-    cp, p, m = _export_sources(workflow, proposal, request, result, destination)
-    pipe = _pipeline(manifest, cp, p, m, predecessor=message)
-    return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, **pipe}
+    from .synthetic_fixture import build_synthetic_resolver, synthetic_refund_policy
 
+    manifest = _manifest()
+    bundle = json.loads(
+        Path(os.environ["UPSTREAM_REPLAY_SUCCESS_EXAMPLE"]).read_text(encoding="utf-8")
+    )
+    message = make_message(bundle, message_id=f"fixture-{outcome}")
+    proposal = runtime_proposal_model(bundle)
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    runtime = load_executor_runtime()
+    destination = runtime["DurableRefundDestination"](tmp_path / "moltbot-state")
+    store_path = tmp_path / "exchange.sqlite"
+
+    mutate = None
+    lose_ack = outcome == "lost_ack"
+    partial = outcome == "partial"
+    if outcome == "hold":
+        grant = resolver.contexts[base.PROFILE_AUTH_CONTEXT]["grant"]
+        resolver.statuses[grant["grant_id"]].status = "revoked"
+    elif outcome == "denied_after_decision":
+        def mutate(current):
+            grant = current.contexts[base.PROFILE_AUTH_CONTEXT]["grant"]
+            current.statuses[grant["grant_id"]].status = "revoked"
+    elif outcome not in {"success", "restart_reconciliation", "duplicate_delivery", "lost_ack", "partial"}:
+        raise ValueError(f"unsupported outcome: {outcome}")
+
+    first = run_exchange(
+        message,
+        bundle,
+        LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
+        destination,
+        evaluation_time=EVAL,
+        manifest=manifest,
+        store_path=store_path,
+        resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
+        mutate_resolver_after_decision=mutate,
+        lose_ack=lose_ack,
+        partial_delivery=partial,
+    )
+    if outcome in {"restart_reconciliation", "duplicate_delivery"}:
+        if outcome == "restart_reconciliation":
+            destination = runtime["DurableRefundDestination"](destination.root)
+        return run_exchange(
+            message,
+            bundle,
+            LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
+            destination,
+            evaluation_time=EVAL,
+            manifest=manifest,
+            store_path=store_path,
+            resolver=resolver,
+            execution_policy_factory=synthetic_refund_policy,
+        )
+    return first
 
 def run_demo(manifest_path: str, replay_path: str, out_path: str) -> dict[str, Any]:
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     bundle = json.loads(Path(replay_path).read_text(encoding="utf-8"))
     tmp = Path(out_path).parent
+    from .synthetic_fixture import build_synthetic_resolver, synthetic_refund_policy
+
     proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_actual_pinned_moltbot_helpers()
-    destination = h.DurableRefundDestination(tmp / "demo-moltbot-state")
-    result = run_exchange(make_message(bundle), bundle, LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"), destination, evaluation_time=EVAL, manifest=manifest, store_path=tmp / "demo_exchange.sqlite", resolver=resolver)
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    runtime = load_executor_runtime()
+    destination = runtime["DurableRefundDestination"](tmp / "demo-moltbot-state")
+    result = run_exchange(
+        make_message(bundle),
+        bundle,
+        LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
+        destination,
+        evaluation_time=EVAL,
+        manifest=manifest,
+        store_path=tmp / "demo_exchange.sqlite",
+        resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
+    )
     Path(out_path).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     return result
 
