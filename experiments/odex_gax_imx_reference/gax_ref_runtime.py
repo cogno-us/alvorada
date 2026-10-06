@@ -88,13 +88,6 @@ def _effect_rows(destination: Any) -> list[dict[str, Any]]:
 
 
 def _export_sources(workflow: Any, proposal: Any, request: Any, result: Any, destination: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Export only the records bound to the current envelope.
-
-    The durable Moltbot destination may contain earlier attempts for the same
-    refund content after restart or redelivery. Replay validates one envelope at
-    a time, so unrelated prior attempts must not be attributed to the current
-    execution namespace.
-    """
     cp_record = workflow.records.load().model_dump(mode="json")
     all_effects = _sqlite_rows(Path(destination.path), "effects")
     all_attempts = _sqlite_rows(Path(destination.path), "attempts")
@@ -264,8 +257,13 @@ def _run_current_request(
     helper = h._load_pinned_helpers()
     now = parse_time(evaluation_time)
     proposal = runtime_proposal_model(bundle)
-    record_store = helper.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}.json", proposal.run_id or "run-gax-imx")
-    cp_destination = helper.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}.json")
+    record_suffix = digest({
+        "message_id": message["message_id"],
+        "message_digest": message.get("message_digest"),
+        "evaluation_time": evaluation_time,
+    })[-16:]
+    record_store = helper.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}-{record_suffix}.json", proposal.run_id or "run-gax-imx")
+    cp_destination = helper.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}-{record_suffix}.json")
     workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
     decision = workflow.decide(proposal, now=now)
 
@@ -282,15 +280,7 @@ def _run_current_request(
     result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=now, simulate=simulate)
     cp_record, p, moltbot = _export_sources(workflow, proposal, request, result, destination)
     pipe = _pipeline(manifest, cp_record, p, moltbot, predecessor=message)
-    return {
-        "status": result.status,
-        "result": result,
-        "decision": decision,
-        "request": request,
-        "destination": destination,
-        "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)},
-        **pipe,
-    }
+    return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, **pipe}
 
 
 def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
@@ -353,38 +343,11 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
     if destination is None:
         assessment["errors"].append("GAX-EXECUTION-DESTINATION-REQUIRED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "destination_required"}, "successor_packet": None}
-
-    artifacts = _run_current_request(
-        message=message,
-        bundle=bundle,
-        manifest=manifest,
-        destination=destination,
-        store_path=store_path,
-        resolver=resolver,
-        evaluation_time=evaluation_time,
-        mutate_resolver_after_decision=mutate_resolver_after_decision,
-        lose_ack=lose_ack,
-        partial_delivery=partial_delivery,
-    )
+    artifacts = _run_current_request(message=message, bundle=bundle, manifest=manifest, destination=destination, store_path=store_path, resolver=resolver, evaluation_time=evaluation_time, mutate_resolver_after_decision=mutate_resolver_after_decision, lose_ack=lose_ack, partial_delivery=partial_delivery)
     result = artifacts.get("result")
     status = artifacts["status"]
     assessment["stages"]["authority"] = "authorized" if status in {"executed", "unknown", "partial", "reconciled", "observed"} else status
-    return {
-        "assessment": assessment,
-        "execution": {
-            "attempted": bool(getattr(result, "attempted", status == "executed")),
-            "attempt_status": status,
-            "newly_executed": bool(getattr(result, "newly_executed", False)),
-            "destination_observed": getattr(result, "observed_state", artifacts["execution_facts"].get("destination_observed")),
-            "effect_id": getattr(result, "effect_id", getattr(artifacts["decision"], "effect_id", None)),
-            "decision_id": getattr(result, "decision_id", getattr(artifacts["decision"], "decision_id", None)),
-            "attempt_id": getattr(result, "attempt_id", None),
-        },
-        "current_reconstruction_bundle": artifacts["reconstruction_bundle"],
-        "odes_reference": artifacts["odes_reference"],
-        "successor_packet": artifacts["successor_packet"],
-        "execution_facts": artifacts["execution_facts"],
-    }
+    return {"assessment": assessment, "execution": {"attempted": bool(getattr(result, "attempted", status == "executed")), "attempt_status": status, "newly_executed": bool(getattr(result, "newly_executed", False)), "destination_observed": getattr(result, "observed_state", artifacts["execution_facts"].get("destination_observed")), "effect_id": getattr(result, "effect_id", getattr(artifacts["decision"], "effect_id", None)), "decision_id": getattr(result, "decision_id", getattr(artifacts["decision"], "decision_id", None)), "attempt_id": getattr(result, "attempt_id", None)}, "current_reconstruction_bundle": artifacts["reconstruction_bundle"], "odes_reference": artifacts["odes_reference"], "successor_packet": artifacts["successor_packet"], "execution_facts": artifacts["execution_facts"]}
 
 
 class TransactionalExchangeStore:
@@ -487,22 +450,7 @@ DurableExchangeStore = TransactionalExchangeStore
 def make_successor_packet(predecessor: dict[str, Any], *, facts: dict[str, Any], state_version: int = 1, current_bundle: dict[str, Any] | None = None, predecessor_packet_id: str | None = None) -> dict[str, Any]:
     source_id = predecessor.get("packet_id") or predecessor.get("message_id")
     source_commitment = digest({k: v for k, v in predecessor.items() if k != "packet_digest"})
-    packet = {
-        "packet_id": f"succ-{source_id}-{state_version}",
-        "profile": PROFILE,
-        "schema_version": PROTOCOL_VERSION,
-        "conversation_id": predecessor.get("conversation_id"),
-        "source_packet_id": source_id,
-        "source_commitment": source_commitment,
-        "predecessor_packet_id": predecessor_packet_id,
-        "state_version": f"state-{state_version}",
-        "relevant_decisions": [facts.get("decision_id")],
-        "pending_effects": facts.get("pending_effects", []),
-        "attempts": facts.get("attempts", {}),
-        "unresolved_delivery": facts.get("unresolved_delivery"),
-        "missing_evidence": [] if current_bundle else ["current_bundle_unavailable"],
-        "next_proposed_work": "reconcile before any further execution",
-    }
+    packet = {"packet_id": f"succ-{source_id}-{state_version}", "profile": PROFILE, "schema_version": PROTOCOL_VERSION, "conversation_id": predecessor.get("conversation_id"), "source_packet_id": source_id, "source_commitment": source_commitment, "predecessor_packet_id": predecessor_packet_id, "state_version": f"state-{state_version}", "relevant_decisions": [facts.get("decision_id")], "pending_effects": facts.get("pending_effects", []), "attempts": facts.get("attempts", {}), "unresolved_delivery": facts.get("unresolved_delivery"), "missing_evidence": [] if current_bundle else ["current_bundle_unavailable"], "next_proposed_work": "reconcile before any further execution"}
     packet["packet_digest"] = digest({k: v for k, v in packet.items() if k != "packet_digest"})
     return packet
 
