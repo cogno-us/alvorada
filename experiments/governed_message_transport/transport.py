@@ -950,11 +950,7 @@ class LocalDurableTransport:
             if outcome.result_state in {
                 "recovery_required",
                 "historical_artifacts_unavailable",
-            } or (
-                message.get("message_type") in EXECUTION_ELIGIBLE_TYPES
-                and outcome.artifact_export is None
-                and outcome.execution.get("effect_id") is not None
-            ):
+            }:
                 return self._unresolved_receipt_ack(
                     envelope,
                     now=trusted_now,
