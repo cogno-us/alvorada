@@ -74,9 +74,9 @@ Batch 2 does not modify consumers.
 For integration testing this branch pins:
 
 - Replay proposed head:
-  `710ceb5667762a5e8f3a7b02e14c40eb8e1a9379`
+  `f63ce914504dd06813c4ccd199b0570dbd8dd427`
 - ODES proposed head:
-  `aa7c53d3ad8c1d0b9c42620e9c8e2b99cd203873`
+  `cba83a1c06f718a8afd76178f36e5cc15896347d`
 
 The preserved Replay proposal currently recognizes producer profile 1.0.0 but
 pins Moltbot repository revision
