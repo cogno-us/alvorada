@@ -189,7 +189,9 @@ def _artifact_facts(odes_reference: dict[str, Any]) -> dict[str, Any]:
     destination = facts.get("destination_observed")
     ack = facts.get("acknowledgement_summary")
     facts["pending_effects"] = effect_ids if destination == "partial" else []
-    facts["unresolved_delivery"] = bool(destination == "partial" or ack == "unknown")
+    facts["unresolved_delivery"] = bool(
+        destination == "partial" or (ack == "unknown" and (effect_ids or destination in {"applied", "partial", "unknown"}))
+    )
     return facts
 
 
@@ -426,7 +428,10 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
     duplicate, err = store.record_message(message)
     if err:
         return {"assessment": {"permitted_handling": "REFUSE", "errors": [err], "stages": {"identity_binding": "failed"}}, "execution": {"attempted": False, "reason": err}, "successor_packet": None}
-    assessment = assess_message(message, bundle, registry, evaluation_time=evaluation_time, seen_messages=store.seen_messages())
+    seen_messages = store.seen_messages()
+    if seen_messages.get(message["message_id"]) == message["message_digest"]:
+        seen_messages = {key: value for key, value in seen_messages.items() if key != message["message_id"]}
+    assessment = assess_message(message, bundle, registry, evaluation_time=evaluation_time, seen_messages=seen_messages)
     if assessment["permitted_handling"] != "ACCEPT_FOR_ASSESSMENT":
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "message_not_execution_eligible"}, "successor_packet": None}
     if duplicate:
