@@ -510,3 +510,59 @@ assert all(not name.startswith("tests.") for name in sys.modules)
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+
+def test_retained_replay_passes_evidence_pack_and_odes_integrity_without_assurance_inflation(tmp_path):
+    from agent_governance_evidence_pack import (
+        import_manifest_reconstruction,
+        render_traceable_markdown,
+        validate_evidence_pack,
+    )
+
+    transport, destination, message, _ = _accepted_transport(
+        tmp_path, "accepted-consumer-chain"
+    )
+    delivered = transport.deliver(message["message_id"], now=EVAL)
+    assert delivered["transport_state"] == "DELIVERED"
+    assert effect_count(destination) == 1
+
+    retained = transport.retained_artifacts(message["message_id"])
+    assert retained["result_state"] == "original_complete"
+    export = retained["artifact_export"]
+    replay = export["reconstruction_bundle"]
+    odes = export["odes"]
+    successor = export["successor_packet"]
+
+    assert replay["bundle_id"] == export["producer_refs"]["reconstruction_bundle_id"]
+    assert export["content_commitments"]["reconstruction_bundle"] == export["producer_refs"]["reconstruction_digest"]
+    assert export["content_commitments"]["odes_package"] == export["producer_refs"]["odes_package_digest"]
+    assert export["content_commitments"]["recipient_validation"] == export["producer_refs"]["odes_validation_digest"]
+    assert successor["packet_id"] == export["producer_refs"]["successor_packet_id"]
+    assert successor["packet_digest"] == export["producer_refs"]["successor_packet_digest"]
+    assert export["content_commitments"]["successor_packet"] == successor["packet_digest"]
+
+    pack = import_manifest_reconstruction(_load_env("UPSTREAM_MANIFEST_EXAMPLE"), replay)
+    report = validate_evidence_pack(pack)
+    assert report.valid is True
+    rendered = render_traceable_markdown(pack)
+    trace = pack.metadata["traceable_import"]
+
+    assert trace["supported_revisions"]["replay"] == "f63ce914504dd06813c4ccd199b0570dbd8dd427"
+    assert trace["supported_revisions"]["moltbot_safe"] == "1d308faf664c504b6e310db3c7a310153ef7b067"
+    assert trace["supported_revisions"]["odes"] == "cba83a1c06f718a8afd76178f36e5cc15896347d"
+    assert trace["lifecycle_summary"]["independent_verification"] == "unavailable"
+    assert trace["lifecycle_summary"]["current_permission"] == "not_evaluated_from_historical_records"
+    assert "does not authenticate the producer" in rendered
+
+    recipient = odes["recipient_validation"]
+    assert recipient["schema_validity"]["status"] == "pass"
+    assert recipient["package_content_integrity"]["status"] == "pass"
+    assert recipient["integrity_authentication_checks"]["status"] == "unavailable"
+    assert recipient["authority_status_and_freshness"]["status"] == "unavailable"
+    assert recipient["recipient_reliance_decision"]["status"] in {"fail", "informational_only"}
+
+    duplicate = transport.deliver(message["message_id"], now=EVAL, force=True)
+    assert duplicate["transport_state"] == "DELIVERED"
+    assert effect_count(destination) == 1
+    assert transport.retained_artifacts(message["message_id"]) == retained
