@@ -88,13 +88,37 @@ def _effect_rows(destination: Any) -> list[dict[str, Any]]:
 
 
 def _export_sources(workflow: Any, proposal: Any, request: Any, result: Any, destination: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Export only the records bound to the current envelope.
+
+    The durable Moltbot destination may contain earlier attempts for the same
+    refund content after restart or redelivery. Replay validates one envelope at
+    a time, so unrelated prior attempts must not be attributed to the current
+    execution namespace.
+    """
     cp_record = workflow.records.load().model_dump(mode="json")
+    all_effects = _sqlite_rows(Path(destination.path), "effects")
+    all_attempts = _sqlite_rows(Path(destination.path), "attempts")
+    all_events = _sqlite_rows(Path(destination.path), "attempt_events")
+    current_effect = request.effect_id
+    current_decision = request.decision_id
+    current_attempt_ids: set[str] = set()
+    if getattr(result, "attempt_id", None):
+        current_attempt_ids.add(str(result.attempt_id))
+    selected_attempts: list[dict[str, Any]] = []
+    for row in all_attempts:
+        if row.get("effect_id") != current_effect:
+            continue
+        if row.get("decision_id") == current_decision or row.get("attempt_id") in current_attempt_ids:
+            selected_attempts.append(row)
+            if row.get("attempt_id"):
+                current_attempt_ids.add(str(row["attempt_id"]))
+    selected_events = [row for row in all_events if row.get("attempt_id") in current_attempt_ids]
     moltbot = {
         "execution_envelope": dataclasses.asdict(request),
         "execution_result": dataclasses.asdict(result),
-        "effects": _sqlite_rows(Path(destination.path), "effects"),
-        "attempts": _sqlite_rows(Path(destination.path), "attempts"),
-        "attempt_events": _sqlite_rows(Path(destination.path), "attempt_events"),
+        "effects": [row for row in all_effects if row.get("effect_id") == current_effect],
+        "attempts": selected_attempts,
+        "attempt_events": selected_events,
     }
     return cp_record, proposal.model_dump(mode="json", exclude_none=False), moltbot
 
@@ -406,15 +430,15 @@ class TransactionalExchangeStore:
     def accept_successor(self, packet: dict[str, Any], predecessor: dict[str, Any]) -> dict[str, Any]:
         if packet.get("packet_digest") != self._material_digest(packet):
             return {"loaded": False, "effect_created": False, "status": "packet_digest_mismatch"}
-        if predecessor.get("packet_digest") and predecessor.get("packet_digest") != self._material_digest(predecessor):
-            return {"loaded": False, "effect_created": False, "status": "predecessor_digest_mismatch"}
-        predecessor_digest = predecessor.get("packet_digest") or self._material_digest(predecessor)
         if packet.get("profile") != PROFILE or packet.get("schema_version") != PROTOCOL_VERSION:
             return {"loaded": False, "effect_created": False, "status": "unsupported_profile_or_schema"}
         if packet.get("conversation_id") != predecessor.get("conversation_id"):
             return {"loaded": False, "effect_created": False, "status": "conversation_mismatch"}
         if packet.get("source_packet_id") not in {predecessor.get("message_id"), predecessor.get("packet_id")}:
             return {"loaded": False, "effect_created": False, "status": "source_identity_mismatch"}
+        if predecessor.get("packet_digest") and predecessor.get("packet_digest") != self._material_digest(predecessor):
+            return {"loaded": False, "effect_created": False, "status": "predecessor_digest_mismatch"}
+        predecessor_digest = predecessor.get("packet_digest") or self._material_digest(predecessor)
         if packet.get("source_commitment") != predecessor_digest:
             return {"loaded": False, "effect_created": False, "status": "source_commitment_mismatch"}
         try:
