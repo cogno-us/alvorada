@@ -4,7 +4,6 @@ import copy
 import hashlib
 import json
 import sqlite3
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -15,9 +14,14 @@ TRANSPORT_PROFILE = "urn:cognous:profiles:governed-message-transport:0.1.0"
 TRANSPORT_VERSION = "0.1.0"
 CANONICALIZATION_VERSION = "json-sort-keys-compact-v1"
 ACK_KIND_DURABLE_RECEIPT = "DURABLE_RECEIPT"
+ACK_KIND_DURABLE_RECEIPT_UNRESOLVED = "DURABLE_RECEIPT_UNRESOLVED"
 ACK_KIND_TERMINAL_REJECTION = "TERMINAL_REJECTION"
 EXECUTION_ELIGIBLE_TYPES = {"PROPOSE", "REQUEST"}
 INFORMATIONAL_TYPES = {"REPORT", "REFUSE", "NOT_UNDERSTOOD"}
+
+
+class SyntheticTransportInterruption(RuntimeError):
+    pass
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -35,6 +39,8 @@ def commitment(value: Any) -> str:
 
 
 def parse_time(value: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError("timestamp is required")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("timestamp must be timezone-aware")
@@ -45,6 +51,49 @@ def iso(value: datetime) -> str:
     if value.tzinfo is None:
         raise ValueError("timestamp must be timezone-aware")
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@dataclass(frozen=True)
+class DeliveryClockPolicy:
+    """Trusted local clock policy for transport and recipient assessment.
+
+    The caller supplies the trusted delivery instant. Timestamps embedded in a
+    message or envelope never advance that clock. Zero future skew is the
+    conservative local-reference default.
+    """
+
+    max_future_skew_seconds: int = 0
+
+    def validate_now(self, now: str) -> datetime:
+        return parse_time(now)
+
+    def validate_temporal_binding(
+        self,
+        *,
+        envelope: dict[str, Any],
+        message: dict[str, Any],
+        now: str,
+    ) -> datetime:
+        trusted_now = self.validate_now(now)
+        envelope_created = parse_time(envelope.get("created_at"))
+        envelope_expires = parse_time(envelope.get("expires_at"))
+        message_created = parse_time(message.get("created_at"))
+        message_expires = parse_time(message.get("expires_at"))
+
+        skew = timedelta(seconds=self.max_future_skew_seconds)
+        if envelope_created > trusted_now + skew:
+            raise ValueError("envelope_created_at_in_future")
+        if message_created > trusted_now + skew:
+            raise ValueError("message_created_at_in_future")
+        if envelope_created < message_created:
+            raise ValueError("envelope_created_before_message")
+        if message_expires <= message_created:
+            raise ValueError("message_expiry_not_after_creation")
+        if envelope_expires != message_expires:
+            raise ValueError("envelope_message_expiry_mismatch")
+        if message_expires <= trusted_now:
+            raise ValueError("governed_message_expired")
+        return trusted_now
 
 
 def governed_message_commitment(message: dict[str, Any]) -> str:
@@ -72,6 +121,14 @@ class Route:
     local_endpoint: bool = True
     configured_identity_authenticated: bool = False
 
+    def transport_binding(self) -> tuple[str, str, str, str]:
+        return (
+            self.sender_endpoint_ref,
+            self.sender_identity_ref,
+            self.recipient_endpoint_ref,
+            self.recipient_identity_ref,
+        )
+
 
 class TrustedRouteTable:
     """Explicit local routing configuration.
@@ -84,12 +141,35 @@ class TrustedRouteTable:
         self._routes = {route.route_id: route for route in routes}
         if len(self._routes) != len(routes):
             raise ValueError("route_id values must be unique")
+        by_binding: dict[tuple[str, str, str, str], list[str]] = {}
+        for route in routes:
+            by_binding.setdefault(route.transport_binding(), []).append(route.route_id)
+        ambiguous = [ids for ids in by_binding.values() if len(ids) > 1]
+        if ambiguous:
+            raise ValueError("ambiguous transport route binding")
 
     def resolve(self, route_id: str) -> Route:
         try:
             return self._routes[route_id]
         except KeyError as exc:
             raise LookupError("unknown trusted route") from exc
+
+    def resolve_envelope(self, envelope: dict[str, Any]) -> Route:
+        binding = (
+            envelope.get("sender_endpoint_ref"),
+            envelope.get("sender_identity_ref"),
+            envelope.get("recipient_endpoint_ref"),
+            envelope.get("recipient_identity_ref"),
+        )
+        matches = [r for r in self._routes.values() if r.transport_binding() == binding]
+        if not matches:
+            raise LookupError("untrusted_or_unknown_route_binding")
+        if len(matches) != 1:
+            raise LookupError("ambiguous_transport_route_binding")
+        route = matches[0]
+        if not route.local_endpoint:
+            raise LookupError("recipient_endpoint_not_local")
+        return route
 
     def verify_sender_endpoint(self, route: Route, sender_endpoint_ref: str) -> bool:
         return sender_endpoint_ref == route.sender_endpoint_ref
@@ -115,9 +195,10 @@ class RecipientOutcome:
 class AcceptedGaxRecipientAdapter:
     """Adapter to the accepted GAX/IMX reference assessment/execution path.
 
-    REPORT, REFUSE and NOT_UNDERSTOOD are assessment-only. PROPOSE and REQUEST
-    may proceed to run_exchange, which keeps authorization in the pinned Control
-    Plane and effects behind the constrained executor.
+    Each new recipient assessment receives the trusted delivery time from the
+    transport. That same instant is supplied to run_exchange so the accepted
+    Control Plane and executor perform current-time authorization/revalidation.
+    Historical transport duplicates do not call this adapter again.
     """
 
     def __init__(
@@ -125,11 +206,12 @@ class AcceptedGaxRecipientAdapter:
         *,
         bundle: dict[str, Any],
         registry: Any,
-        evaluation_time: str,
         manifest: dict[str, Any],
         exchange_store_path: str | Path,
         resolver: Any,
         destination: Any,
+        clock_policy: DeliveryClockPolicy | None = None,
+        evaluation_time: str | None = None,
     ):
         from experiments.odex_gax_imx_reference.gax_ref_runtime import (
             assess_message,
@@ -140,18 +222,22 @@ class AcceptedGaxRecipientAdapter:
         self._run_exchange = run_exchange
         self.bundle = bundle
         self.registry = registry
-        self.evaluation_time = evaluation_time
         self.manifest = manifest
         self.exchange_store_path = Path(exchange_store_path)
         self.resolver = resolver
         self.destination = destination
+        self.clock_policy = clock_policy or DeliveryClockPolicy()
+        # Retained only for source compatibility with the initial transport
+        # profile. It is intentionally not used for recipient evaluation.
+        self.constructor_evaluation_time = evaluation_time
 
-    def handle(self, message: dict[str, Any]) -> RecipientOutcome:
+    def handle(self, message: dict[str, Any], *, delivery_time: str) -> RecipientOutcome:
+        current_time = iso(self.clock_policy.validate_now(delivery_time))
         assessment = self._assess_message(
             copy.deepcopy(message),
             self.bundle,
             self.registry,
-            evaluation_time=self.evaluation_time,
+            evaluation_time=current_time,
         )
         message_type = message.get("message_type")
         if message_type in INFORMATIONAL_TYPES:
@@ -187,7 +273,7 @@ class AcceptedGaxRecipientAdapter:
             self.bundle,
             self.registry,
             self.destination,
-            evaluation_time=self.evaluation_time,
+            evaluation_time=current_time,
             manifest=self.manifest,
             store_path=self.exchange_store_path,
             resolver=self.resolver,
@@ -553,11 +639,12 @@ class LocalDurableTransport:
         sender_store_path: str | Path,
         recipient_store_path: str | Path,
         routes: TrustedRouteTable,
-        recipient_handler: Callable[[dict[str, Any]], RecipientOutcome] | Any,
+        recipient_handler: Callable[..., RecipientOutcome] | Any,
         max_attempts: int = 3,
         base_backoff_seconds: int = 1,
         attempt_id_factory: Callable[[], str] | None = None,
         ack_id_factory: Callable[[], str] | None = None,
+        clock_policy: DeliveryClockPolicy | None = None,
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -571,6 +658,7 @@ class LocalDurableTransport:
         self.base_backoff_seconds = base_backoff_seconds
         self.attempt_id_factory = attempt_id_factory or (lambda: "delivery-" + uuid.uuid4().hex)
         self.ack_id_factory = ack_id_factory or (lambda: "ack-" + uuid.uuid4().hex)
+        self.clock_policy = clock_policy or DeliveryClockPolicy()
 
     def queue(
         self,
@@ -581,6 +669,7 @@ class LocalDurableTransport:
         now: str,
         correlation_id: str | None = None,
     ) -> dict[str, Any]:
+        trusted_now = iso(self.clock_policy.validate_now(now))
         route = self.routes.resolve(route_id)
         if not self.routes.verify_sender_endpoint(route, sender_endpoint_ref):
             raise PermissionError("sender endpoint is not trusted for route")
@@ -588,16 +677,51 @@ class LocalDurableTransport:
             raise PermissionError("governed sender claim does not match configured route")
         if message.get("recipient") != route.expected_recipient_claim:
             raise PermissionError("governed recipient claim does not match configured route")
-        content_commitment = governed_message_commitment(message)
+        governed_message_commitment(message)
+        # Queue-time timestamp checks use the same trusted clock policy as delivery.
+        envelope_preview = make_transport_envelope(
+            governed_message=message,
+            route=route,
+            delivery_attempt_id="queue-validation",
+            correlation_id=correlation_id,
+            created_at=trusted_now,
+        )
+        self.clock_policy.validate_temporal_binding(
+            envelope=envelope_preview,
+            message=message,
+            now=trusted_now,
+        )
+        content_commitment = message["message_digest"]
         self.sender_store.enqueue(
             message=copy.deepcopy(message),
             route_id=route_id,
             content_commitment=content_commitment,
-            created_at=now,
+            created_at=trusted_now,
             expires_at=message["expires_at"],
             correlation_id=correlation_id,
         )
         return self.sender_store.outbox_record(message["message_id"]) or {}
+
+    def _ack(
+        self,
+        envelope: dict[str, Any],
+        *,
+        now: str,
+        kind: str,
+        detail: dict[str, Any],
+    ) -> dict[str, Any]:
+        ack = {
+            "acknowledgement_id": self.ack_id_factory(),
+            "acknowledgement_kind": kind,
+            "message_id": envelope.get("message_id"),
+            "delivery_attempt_id": envelope.get("delivery_attempt_id"),
+            "content_commitment": envelope.get("content_commitment"),
+            "recipient_endpoint_ref": envelope.get("recipient_endpoint_ref"),
+            "created_at": now,
+            "detail": detail,
+        }
+        self.recipient_store.record_ack(ack)
+        return ack
 
     def _recipient_reject(
         self,
@@ -606,96 +730,135 @@ class LocalDurableTransport:
         now: str,
         reason: str,
     ) -> dict[str, Any]:
-        ack = {
-            "acknowledgement_id": self.ack_id_factory(),
-            "acknowledgement_kind": ACK_KIND_TERMINAL_REJECTION,
-            "message_id": envelope.get("message_id"),
-            "delivery_attempt_id": envelope.get("delivery_attempt_id"),
-            "content_commitment": envelope.get("content_commitment"),
-            "recipient_endpoint_ref": envelope.get("recipient_endpoint_ref"),
-            "created_at": now,
-            "detail": {
+        return self._ack(
+            envelope,
+            now=now,
+            kind=ACK_KIND_TERMINAL_REJECTION,
+            detail={
                 "transport_status": "rejected",
                 "reason": reason,
                 "authorization": "not_evaluated_by_transport",
                 "external_effect": "not_established",
             },
-        }
-        self.recipient_store.record_ack(ack)
-        return ack
+        )
 
-    def receive_envelope(self, envelope: dict[str, Any], *, now: str) -> dict[str, Any]:
-        if envelope.get("transport_profile") != TRANSPORT_PROFILE:
-            return self._recipient_reject(envelope, now=now, reason="unsupported_transport_profile")
-        if envelope.get("transport_version") != TRANSPORT_VERSION:
-            return self._recipient_reject(envelope, now=now, reason="unsupported_transport_version")
-        if envelope.get("canonicalization_version") != CANONICALIZATION_VERSION:
-            return self._recipient_reject(envelope, now=now, reason="unsupported_canonicalization")
+    def _unresolved_receipt_ack(
+        self,
+        envelope: dict[str, Any],
+        *,
+        now: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        return self._ack(
+            envelope,
+            now=now,
+            kind=ACK_KIND_DURABLE_RECEIPT_UNRESOLVED,
+            detail={
+                "acknowledged_object": "durable_inbox_receipt",
+                "recipient_processing_status": "unresolved",
+                "reason": reason,
+                "authorization": "not_established",
+                "execution": "not_established",
+                "destination_observation": "not_established",
+                "independent_verification": "not_established",
+            },
+        )
 
+    def receive_envelope(
+        self,
+        envelope: dict[str, Any],
+        *,
+        now: str,
+        fault_after_receipt: bool = False,
+        fault_after_handler: bool = False,
+    ) -> dict[str, Any]:
         try:
-            route = next(
-                r
-                for r in self.routes._routes.values()
-                if r.recipient_endpoint_ref == envelope.get("recipient_endpoint_ref")
-            )
-        except StopIteration:
-            return self._recipient_reject(envelope, now=now, reason="wrong_or_unknown_recipient_endpoint")
+            trusted_now = iso(self.clock_policy.validate_now(now))
+        except (TypeError, ValueError):
+            # Without a valid trusted current time, no transport conclusion is usable.
+            trusted_now = now if isinstance(now, str) else ""
+            return self._recipient_reject(envelope, now=trusted_now, reason="invalid_trusted_delivery_time")
 
-        if not self.routes.verify_recipient_endpoint(route, envelope.get("recipient_endpoint_ref", "")):
-            return self._recipient_reject(envelope, now=now, reason="wrong_or_unknown_recipient_endpoint")
-        if not self.routes.verify_sender_endpoint(route, envelope.get("sender_endpoint_ref", "")):
-            return self._recipient_reject(envelope, now=now, reason="untrusted_sender_endpoint")
-        if envelope.get("sender_identity_ref") != route.sender_identity_ref:
-            return self._recipient_reject(envelope, now=now, reason="sender_identity_ref_mismatch")
-        if envelope.get("recipient_identity_ref") != route.recipient_identity_ref:
-            return self._recipient_reject(envelope, now=now, reason="recipient_identity_ref_mismatch")
+        if envelope.get("transport_profile") != TRANSPORT_PROFILE:
+            return self._recipient_reject(envelope, now=trusted_now, reason="unsupported_transport_profile")
+        if envelope.get("transport_version") != TRANSPORT_VERSION:
+            return self._recipient_reject(envelope, now=trusted_now, reason="unsupported_transport_version")
+        if envelope.get("canonicalization_version") != CANONICALIZATION_VERSION:
+            return self._recipient_reject(envelope, now=trusted_now, reason="unsupported_canonicalization")
 
         message = envelope.get("governed_message")
         if not isinstance(message, dict):
-            return self._recipient_reject(envelope, now=now, reason="missing_governed_message")
+            return self._recipient_reject(envelope, now=trusted_now, reason="missing_governed_message")
         if message.get("message_id") != envelope.get("message_id"):
-            return self._recipient_reject(envelope, now=now, reason="message_identity_mismatch")
+            return self._recipient_reject(envelope, now=trusted_now, reason="message_identity_mismatch")
+        if message.get("conversation_id") != envelope.get("conversation_id"):
+            return self._recipient_reject(envelope, now=trusted_now, reason="conversation_identity_mismatch")
+
+        try:
+            self.clock_policy.validate_temporal_binding(
+                envelope=envelope,
+                message=message,
+                now=trusted_now,
+            )
+        except (TypeError, ValueError) as exc:
+            return self._recipient_reject(envelope, now=trusted_now, reason=str(exc))
+
+        try:
+            route = self.routes.resolve_envelope(envelope)
+        except LookupError as exc:
+            return self._recipient_reject(envelope, now=trusted_now, reason=str(exc))
         if message.get("sender") != route.expected_sender_claim:
-            return self._recipient_reject(envelope, now=now, reason="sender_claim_mismatch")
+            return self._recipient_reject(envelope, now=trusted_now, reason="sender_claim_mismatch")
         if message.get("recipient") != route.expected_recipient_claim:
-            return self._recipient_reject(envelope, now=now, reason="recipient_claim_mismatch")
+            return self._recipient_reject(envelope, now=trusted_now, reason="recipient_claim_mismatch")
+
         try:
             expected = governed_message_commitment(message)
         except ValueError as exc:
-            return self._recipient_reject(envelope, now=now, reason=str(exc))
+            return self._recipient_reject(envelope, now=trusted_now, reason=str(exc))
         if expected != envelope.get("content_commitment"):
-            return self._recipient_reject(envelope, now=now, reason="content_commitment_mismatch")
-        if parse_time(envelope["expires_at"]) <= parse_time(now):
-            return self._recipient_reject(envelope, now=now, reason="expired")
+            return self._recipient_reject(envelope, now=trusted_now, reason="content_commitment_mismatch")
 
         try:
-            is_new, _ = self.recipient_store.record_inbox_before_ack(envelope=envelope, now=now)
+            is_new, _ = self.recipient_store.record_inbox_before_ack(
+                envelope=envelope,
+                now=trusted_now,
+            )
         except ValueError:
-            return self._recipient_reject(envelope, now=now, reason="message_id_content_conflict")
+            return self._recipient_reject(
+                envelope,
+                now=trusted_now,
+                reason="message_id_content_conflict",
+            )
+
+        if fault_after_receipt and is_new:
+            raise SyntheticTransportInterruption("after_receipt_before_recipient_processing")
 
         if is_new:
-            outcome = self.recipient_handler.handle(copy.deepcopy(message))
+            outcome = self.recipient_handler.handle(
+                copy.deepcopy(message),
+                delivery_time=trusted_now,
+            )
+            if fault_after_handler:
+                raise SyntheticTransportInterruption("after_recipient_processing_before_outcome_persistence")
             self.recipient_store.record_recipient_outcome(message["message_id"], outcome)
         else:
             outcome = self.recipient_store.prior_outcome(message["message_id"])
             if outcome is None:
-                return self._recipient_reject(
+                return self._unresolved_receipt_ack(
                     envelope,
-                    now=now,
+                    now=trusted_now,
                     reason="durable_receipt_without_recipient_outcome",
                 )
 
-        ack = {
-            "acknowledgement_id": self.ack_id_factory(),
-            "acknowledgement_kind": ACK_KIND_DURABLE_RECEIPT,
-            "message_id": message["message_id"],
-            "delivery_attempt_id": envelope["delivery_attempt_id"],
-            "content_commitment": envelope["content_commitment"],
-            "recipient_endpoint_ref": envelope["recipient_endpoint_ref"],
-            "created_at": now,
-            "detail": {
+        return self._ack(
+            envelope,
+            now=trusted_now,
+            kind=ACK_KIND_DURABLE_RECEIPT,
+            detail={
                 "acknowledged_object": "durable_inbox_receipt",
                 "duplicate_suppressed": not is_new,
+                "recipient_processing_status": "retained",
                 "recipient_assessment_handling": outcome.assessment.get("permitted_handling"),
                 "authorization": "not_implied_by_acknowledgement",
                 "execution": "not_implied_by_acknowledgement",
@@ -703,9 +866,7 @@ class LocalDurableTransport:
                 "independent_verification": "not_implied_by_acknowledgement",
                 "producer_refs": copy.deepcopy(outcome.producer_refs),
             },
-        }
-        self.recipient_store.record_ack(ack)
-        return ack
+        )
 
     def deliver(
         self,
@@ -714,7 +875,10 @@ class LocalDurableTransport:
         now: str,
         lose_ack: bool = False,
         force: bool = False,
+        fault_after_receipt: bool = False,
+        fault_after_handler: bool = False,
     ) -> dict[str, Any]:
+        trusted_now = iso(self.clock_policy.validate_now(now))
         row = self.sender_store.outbox_record(message_id)
         if row is None:
             raise LookupError("message not queued")
@@ -724,7 +888,7 @@ class LocalDurableTransport:
                 "transport_state": row["state"],
                 "attempted": False,
             }
-        if parse_time(row["expires_at"]) <= parse_time(now):
+        if parse_time(row["expires_at"]) <= parse_time(trusted_now):
             self.sender_store.mark_outbox(
                 message_id,
                 state="TERMINAL_REJECTED",
@@ -736,7 +900,7 @@ class LocalDurableTransport:
                 "attempted": False,
                 "reason": "expired_before_dispatch",
             }
-        if row["next_attempt_at"] and parse_time(now) < parse_time(row["next_attempt_at"]):
+        if row["next_attempt_at"] and parse_time(trusted_now) < parse_time(row["next_attempt_at"]):
             return {
                 "message_id": message_id,
                 "transport_state": "BACKOFF",
@@ -768,7 +932,7 @@ class LocalDurableTransport:
             route=route,
             delivery_attempt_id=attempt_id,
             correlation_id=row["correlation_id"],
-            created_at=now,
+            created_at=trusted_now,
             retry_of_attempt_id=retry_of,
         )
         self.sender_store.record_attempt(
@@ -776,18 +940,48 @@ class LocalDurableTransport:
             route_id=row["route_id"],
             ordinal=ordinal,
             retry_of_attempt_id=retry_of,
-            now=now,
+            now=trusted_now,
         )
 
-        ack = self.receive_envelope(copy.deepcopy(envelope), now=now)
+        try:
+            ack = self.receive_envelope(
+                copy.deepcopy(envelope),
+                now=trusted_now,
+                fault_after_receipt=fault_after_receipt,
+                fault_after_handler=fault_after_handler,
+            )
+        except SyntheticTransportInterruption as exc:
+            next_time = parse_time(trusted_now) + timedelta(
+                seconds=self.base_backoff_seconds * (2 ** max(0, ordinal - 1))
+            )
+            self.sender_store.mark_attempt(
+                attempt_id,
+                state="INTERRUPTED",
+                now=trusted_now,
+                reason=str(exc),
+            )
+            self.sender_store.mark_outbox(
+                message_id,
+                state="PENDING_RETRY",
+                next_attempt_at=iso(next_time),
+            )
+            return {
+                "message_id": message_id,
+                "delivery_attempt_id": attempt_id,
+                "transport_state": "PENDING_RETRY",
+                "attempted": True,
+                "acknowledgement_received": False,
+                "interruption": str(exc),
+            }
+
         if lose_ack:
-            next_time = parse_time(now) + timedelta(
+            next_time = parse_time(trusted_now) + timedelta(
                 seconds=self.base_backoff_seconds * (2 ** max(0, ordinal - 1))
             )
             self.sender_store.mark_attempt(
                 attempt_id,
                 state="ACK_LOST",
-                now=now,
+                now=trusted_now,
                 reason="synthetic_ack_loss",
             )
             if ordinal >= self.max_attempts:
@@ -813,12 +1007,13 @@ class LocalDurableTransport:
             }
 
         self.sender_store.record_ack(ack)
-        if ack["acknowledgement_kind"] == ACK_KIND_TERMINAL_REJECTION:
+        kind = ack["acknowledgement_kind"]
+        if kind == ACK_KIND_TERMINAL_REJECTION:
             reason = (ack.get("detail") or {}).get("reason")
             self.sender_store.mark_attempt(
                 attempt_id,
                 state="TERMINAL_REJECTED",
-                now=now,
+                now=trusted_now,
                 acknowledgement_id=ack["acknowledgement_id"],
                 reason=reason,
             )
@@ -828,11 +1023,26 @@ class LocalDurableTransport:
                 terminal_reason=reason,
             )
             state = "TERMINAL_REJECTED"
+        elif kind == ACK_KIND_DURABLE_RECEIPT_UNRESOLVED:
+            reason = (ack.get("detail") or {}).get("reason")
+            self.sender_store.mark_attempt(
+                attempt_id,
+                state="RECEIPT_UNRESOLVED",
+                now=trusted_now,
+                acknowledgement_id=ack["acknowledgement_id"],
+                reason=reason,
+            )
+            self.sender_store.mark_outbox(
+                message_id,
+                state="UNRESOLVED",
+                terminal_reason=reason,
+            )
+            state = "UNRESOLVED"
         else:
             self.sender_store.mark_attempt(
                 attempt_id,
                 state="ACKNOWLEDGED",
-                now=now,
+                now=trusted_now,
                 acknowledgement_id=ack["acknowledgement_id"],
             )
             self.sender_store.mark_outbox(message_id, state="DELIVERED")
@@ -847,6 +1057,7 @@ class LocalDurableTransport:
         }
 
     def recover_due(self, *, now: str, lose_ack: bool = False) -> list[dict[str, Any]]:
+        trusted_now = iso(self.clock_policy.validate_now(now))
         with sqlite3.connect(self.sender_store.path) as con:
             con.row_factory = sqlite3.Row
             rows = [
@@ -861,9 +1072,9 @@ class LocalDurableTransport:
             ]
         results = []
         for row in rows:
-            if row.get("next_attempt_at") and parse_time(now) < parse_time(row["next_attempt_at"]):
+            if row.get("next_attempt_at") and parse_time(trusted_now) < parse_time(row["next_attempt_at"]):
                 continue
-            results.append(self.deliver(row["message_id"], now=now, lose_ack=lose_ack))
+            results.append(self.deliver(row["message_id"], now=trusted_now, lose_ack=lose_ack))
         return results
 
     def evidence(self, message_id: str) -> dict[str, Any]:
@@ -873,6 +1084,13 @@ class LocalDurableTransport:
         sender_acks = self.sender_store.acknowledgement_history(message_id)
         recipient_acks = self.recipient_store.acknowledgement_history(message_id)
         producer_refs: dict[str, Any] = {}
+        recipient_processing_status = "not_received"
+        if inbox:
+            recipient_processing_status = (
+                "retained"
+                if inbox.get("assessment_json") is not None
+                else "unresolved_after_durable_receipt"
+            )
         if inbox and inbox.get("producer_refs_json"):
             producer_refs = json.loads(inbox["producer_refs_json"])
         return {
@@ -882,6 +1100,7 @@ class LocalDurableTransport:
             "content_commitment": outbox.get("content_commitment") if outbox else None,
             "outbox_state": outbox.get("state") if outbox else None,
             "inbox_received_at": inbox.get("received_at") if inbox else None,
+            "recipient_processing_status": recipient_processing_status,
             "delivery_attempts": [
                 {
                     "transport_attempt_id": row["attempt_id"],
