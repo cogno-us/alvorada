@@ -5,7 +5,12 @@ import os
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
+    TransactionalExchangeStore,
+    _pipeline,
+    build_gax_result_export,
     LocalRegistry,
     load_moltbot_runtime,
     make_message,
@@ -342,4 +347,68 @@ def test_replay_odes_failure_after_commit_retries_evidence_without_repeating_eff
     assert retried["execution"]["effect_id"] == original_effect
     assert retried["execution"]["newly_executed"] is False
     assert len(effect_rows(destination)) == 1
+    assert retried["gax_result_export"]["retention_state"] == "complete_regenerated_derivative"
+    assert retried["gax_result_export"]["lineage"]["replacement_effect_executed_for_regeneration"] is False
     assert_artifacts(retried)
+
+
+def test_completed_redelivery_returns_exact_retained_original_artifacts(tmp_path):
+    msg, destination, first = run_success(tmp_path, message_id="m-original-artifacts")
+    original = first["gax_result_export"]
+    replayed = redeliver(tmp_path, msg, destination)
+    assert original["retention_state"] == "complete_original"
+    assert replayed["gax_result_export"] == original
+    assert replayed["current_reconstruction_bundle"] == original["artifacts"]["reconstruction_bundle"]
+    assert replayed["odes_reference"] == original["artifacts"]["odes_reference"]
+    assert replayed["successor_packet"] == original["artifacts"]["successor_packet"]
+    assert len(effect_rows(destination)) == 1
+
+
+def test_retained_artifact_digest_substitution_is_rejected(tmp_path):
+    msg, destination, first = run_success(tmp_path, message_id="m-artifact-substitution")
+    assert first["gax_result_export"]["retention_state"] == "complete_original"
+    store_path = tmp_path / "exchange.sqlite"
+    with sqlite3.connect(store_path) as conn:
+        row = conn.execute(
+            "SELECT export_json FROM workflow_artifacts WHERE message_id=?",
+            (msg["message_id"],),
+        ).fetchone()
+        tampered = json.loads(row[0])
+        tampered["artifacts"]["reconstruction_bundle"]["run_id"] = "tampered"
+        conn.execute(
+            "UPDATE workflow_artifacts SET export_json=? WHERE message_id=?",
+            (json.dumps(tampered, sort_keys=True, separators=(",", ":")), msg["message_id"]),
+        )
+    with pytest.raises(RuntimeError, match="commitment mismatch"):
+        redeliver(tmp_path, msg, destination)
+    assert len(effect_rows(destination)) == 1
+
+
+def test_regenerated_derivative_identity_is_not_relabelled_as_original(tmp_path):
+    msg, destination, first = run_success(tmp_path, message_id="m-lineage-separation")
+    original = first["gax_result_export"]
+    store = TransactionalExchangeStore(tmp_path / "exchange.sqlite")
+    association = store.workflow_for_message(msg)
+    regenerated = _pipeline(
+        manifest(),
+        association["cp_record"],
+        association["proposal"],
+        association["moltbot"],
+        predecessor=msg,
+    )
+    derivative = build_gax_result_export(
+        msg,
+        {
+            "result": association["result"],
+            "decision": association["decision"],
+            "moltbot_record": association["moltbot"],
+            **regenerated,
+        },
+        lineage_kind="regenerated_derivative",
+        source_checkpoint={"effect_id": association["effect_id"]},
+    )
+    assert derivative["retention_state"] == "complete_regenerated_derivative"
+    assert derivative["artifacts"]["reconstruction_bundle"]["bundle_id"] != original["artifacts"]["reconstruction_bundle"]["bundle_id"]
+    assert derivative["lineage"]["kind"] == "regenerated_derivative"
+    assert original["lineage"]["kind"] == "original"
+    assert len(effect_rows(destination)) == 1
