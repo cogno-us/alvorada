@@ -951,7 +951,7 @@ class LocalDurableTransport:
                 "recovery_required",
                 "historical_artifacts_unavailable",
             } or (
-                message_type in EXECUTION_ELIGIBLE_TYPES
+                message.get("message_type") in EXECUTION_ELIGIBLE_TYPES
                 and outcome.artifact_export is None
                 and outcome.execution.get("effect_id") is not None
             ):
