@@ -329,7 +329,13 @@ def test_expiry_and_retry_exhaustion_are_terminal_or_unresolved(tmp_path):
     t = transport(tmp_path, handler, max_attempts=2)
 
     expired = message(message_id="expired", expires_at="2026-10-06T11:59:30Z")
-    queue(t, expired)
+    t.queue(
+        expired,
+        route_id="local-a-b",
+        sender_endpoint_ref="local://sender-a",
+        now="2026-10-06T11:59:10Z",
+        correlation_id="corr-expired",
+    )
     result = t.deliver("expired", now=NOW)
     assert result["transport_state"] == "TERMINAL_REJECTED"
     assert result["reason"] == "expired_before_dispatch"
