@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from experiments.odex_gax_imx_reference.gax_ref import (
+from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     DestinationState, LocalRegistry, TransactionalExchangeStore, _build_resolver,
     assess_message, digest, execution_facts, export_odes_reference, load_successor_packet,
     make_message, make_successor_packet, parse_time, run_exchange, runtime_proposal_model,
