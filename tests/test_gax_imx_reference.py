@@ -239,12 +239,11 @@ def test_run_exchange_partial_delivery_successor_reports_pending_unresolved_effe
 
 def test_success_uses_actual_executor_and_replay_odes_pipeline(tmp_path):
     outcome = run_actual_outcome(tmp_path, "success")
-    result = outcome["result"]
-    assert result.status == "executed"
-    assert result.newly_executed is True
-    assert len(outcome["destination_effects"]) == 1
-    assert any(r.record_type == "runtime_decision" for r in outcome["reconstruction"].records)
-    assert any(r.record_type == "destination_effect" for r in outcome["reconstruction"].records)
+    assert outcome["execution"]["attempt_status"] == "executed"
+    assert outcome["execution"]["newly_executed"] is True
+    assert len(outcome["execution_facts"]["destination_effects"]) == 1
+    assert any(r["record_type"] == "runtime_decision" for r in outcome["current_reconstruction_bundle"]["records"])
+    assert any(r["record_type"] == "destination_effect" for r in outcome["current_reconstruction_bundle"]["records"])
     assert outcome["successor_packet"] is not None
     validation = outcome["odes_reference"]["recipient_validation"]
     assert validation["schema_validity"]["status"] == "pass"
@@ -281,17 +280,17 @@ def test_odes_package_is_not_mutated_after_export(tmp_path):
 )
 def test_pipeline_exists_for_supported_outcomes(tmp_path, outcome, expected_status, expected_effects):
     result = run_actual_outcome(tmp_path / outcome, outcome)
-    assert result["status"] == expected_status
-    assert len(result["destination_effects"]) == expected_effects
-    assert result["reconstruction_bundle"]["records"]
+    assert result["execution"]["attempt_status"] == expected_status
+    assert len(result["execution_facts"]["destination_effects"]) == expected_effects
+    assert result["current_reconstruction_bundle"]["records"]
     assert result["successor_packet"] is not None
     assert result["odes_reference"]["recipient_validation"]["package_content_integrity"]["status"] == "pass"
     if outcome == "partial":
         assert result["execution_facts"]["destination_observed"] == "partial"
         assert result["successor_packet"]["pending_effects"]
     if outcome in {"restart_reconciliation", "duplicate_delivery"}:
-        assert result["result"].newly_executed is False
-        assert result["result"].attempt_id is not None
+        assert result["execution"]["newly_executed"] is False
+        assert result["execution"]["attempt_id"] is not None
 
 
 def test_identical_refund_content_with_different_operation_identity_does_not_reconcile(tmp_path):
