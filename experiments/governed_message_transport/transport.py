@@ -183,12 +183,14 @@ class RecipientOutcome:
     assessment: dict[str, Any]
     execution: dict[str, Any]
     producer_refs: dict[str, Any]
+    artifacts: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "assessment": copy.deepcopy(self.assessment),
             "execution": copy.deepcopy(self.execution),
             "producer_refs": copy.deepcopy(self.producer_refs),
+            "artifacts": copy.deepcopy(self.artifacts),
         }
 
 
@@ -288,10 +290,17 @@ class AcceptedGaxRecipientAdapter:
             ),
             "successor_packet_id": (result.get("successor_packet") or {}).get("packet_id"),
         }
+        artifact_result = copy.deepcopy(result.get("artifact_result"))
+        if artifact_result is not None:
+            retained_refs = artifact_result.get("producer_refs") or {}
+            for key, value in retained_refs.items():
+                if value is not None:
+                    producer_refs[key] = value
         return RecipientOutcome(
             assessment=copy.deepcopy(result.get("assessment") or assessment),
             execution=execution,
             producer_refs={k: v for k, v in producer_refs.items() if v is not None},
+            artifacts=artifact_result,
         )
 
 
@@ -327,7 +336,8 @@ class TransportStore:
                     received_at TEXT NOT NULL,
                     assessment_json TEXT,
                     execution_json TEXT,
-                    producer_refs_json TEXT
+                    producer_refs_json TEXT,
+                    artifacts_json TEXT
                 );
                 CREATE TABLE IF NOT EXISTS attempts (
                     attempt_id TEXT PRIMARY KEY,
@@ -356,6 +366,9 @@ class TransportStore:
                     ON attempts(message_id, ordinal);
                 """
             )
+            columns = {row[1] for row in con.execute("PRAGMA table_info(inbox)")}
+            if "artifacts_json" not in columns:
+                con.execute("ALTER TABLE inbox ADD COLUMN artifacts_json TEXT")
 
     def enqueue(
         self,
@@ -508,8 +521,8 @@ class TransportStore:
                 INSERT INTO inbox(
                     message_id,content_commitment,governed_message_json,
                     sender_endpoint_ref,recipient_endpoint_ref,received_at,
-                    assessment_json,execution_json,producer_refs_json
-                ) VALUES(?,?,?,?,?,?,NULL,NULL,NULL)
+                    assessment_json,execution_json,producer_refs_json,artifacts_json
+                ) VALUES(?,?,?,?,?,?,NULL,NULL,NULL,NULL)
                 """,
                 (
                     envelope["message_id"],
@@ -528,13 +541,14 @@ class TransportStore:
             con.execute(
                 """
                 UPDATE inbox
-                SET assessment_json=?,execution_json=?,producer_refs_json=?
+                SET assessment_json=?,execution_json=?,producer_refs_json=?,artifacts_json=?
                 WHERE message_id=?
                 """,
                 (
                     json.dumps(payload["assessment"], sort_keys=True, separators=(",", ":")),
                     json.dumps(payload["execution"], sort_keys=True, separators=(",", ":")),
                     json.dumps(payload["producer_refs"], sort_keys=True, separators=(",", ":")),
+                    json.dumps(payload["artifacts"], sort_keys=True, separators=(",", ":")) if payload["artifacts"] is not None else None,
                     message_id,
                 ),
             )
@@ -547,6 +561,7 @@ class TransportStore:
             assessment=json.loads(row["assessment_json"]),
             execution=json.loads(row["execution_json"] or "{}"),
             producer_refs=json.loads(row["producer_refs_json"] or "{}"),
+            artifacts=json.loads(row["artifacts_json"]) if row.get("artifacts_json") else None,
         )
 
     def record_ack(self, ack: dict[str, Any]) -> None:
