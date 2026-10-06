@@ -4,7 +4,6 @@ import argparse
 import copy
 import hashlib
 import json
-import os
 import sqlite3
 import tempfile
 from dataclasses import dataclass, field
@@ -15,7 +14,6 @@ from typing import Any
 PROFILE = "urn:cognous:profiles:odex-gax-imx-refund-exchange:0.1.0"
 PROTOCOL_VERSION = "0.1.0"
 SUPPORTED_TYPES = {"PROPOSE", "REQUEST", "REPORT", "REFUSE", "NOT_UNDERSTOOD"}
-EXECUTION_ELIGIBLE_TYPES = {"PROPOSE", "REQUEST"}
 INFORMATIONAL_TYPES = {"REPORT", "REFUSE", "NOT_UNDERSTOOD"}
 PROFILE_AUTH_CONTEXT = "urn:cognous:alvorada:public-stack-profile:0.1.0"
 INSTITUTION = "urn:cognous:institution:synthetic-customer-service"
@@ -51,8 +49,8 @@ def records(bundle: dict[str, Any], record_type: str) -> list[dict[str, Any]]:
 
 
 def first_record(bundle: dict[str, Any], record_type: str) -> dict[str, Any] | None:
-    vals = records(bundle, record_type)
-    return vals[0] if vals else None
+    items = records(bundle, record_type)
+    return items[0] if items else None
 
 
 def data(record: dict[str, Any] | None) -> dict[str, Any]:
@@ -60,22 +58,10 @@ def data(record: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def proposal_from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
-    p = data(first_record(bundle, "runtime_proposal"))
-    if not p:
+    proposal = data(first_record(bundle, "runtime_proposal"))
+    if not proposal:
         raise ValueError("runtime_proposal is required")
-    return p
-
-
-def retained_decision_result(bundle: dict[str, Any]) -> str:
-    d = data(first_record(bundle, "runtime_decision"))
-    raw = str(d.get("result") or d.get("status") or "unknown").lower()
-    if raw in {"authorized", "allow", "granted"}:
-        return "authorized"
-    if raw in {"hold", "held", "requires_review"}:
-        return "hold"
-    if raw in {"deny", "denied", "blocked", "reject"}:
-        return "denied"
-    return raw or "unknown"
+    return proposal
 
 
 def _cp():
@@ -92,14 +78,13 @@ def cp_commitment(value: Any) -> str:
 
 
 def runtime_proposal_model(bundle: dict[str, Any]):
-    RuntimeProposal = _cp()["RuntimeProposal"]
     raw = copy.deepcopy(proposal_from_bundle(bundle))
     raw.setdefault("authority_context_ref", PROFILE_AUTH_CONTEXT)
     raw.setdefault("requirement_id", "urn:cognous:authority-requirement:refund-routine-v1")
     raw.setdefault("evidence_refs", ["urn:cognous:evidence:refund-entitlement"])
     raw.setdefault("effects", 1)
     raw.setdefault("run_id", bundle.get("run_id") or "run-gax-imx")
-    return RuntimeProposal.model_validate(raw)
+    return _cp()["RuntimeProposal"].model_validate(raw)
 
 
 def proposal_commitment(proposal: dict[str, Any] | None = None, *, model: Any | None = None) -> str:
@@ -112,27 +97,12 @@ def operation_commitment(proposal: dict[str, Any] | None = None, *, model: Any |
     p = model.model_dump(mode="json", exclude_none=False)
     return cp_commitment({
         "actor": p.get("actor"), "principal": p.get("principal"), "manifest_id": p.get("manifest_id"),
-        "manifest_version": p.get("manifest_version"), "action_id": p.get("action_id"),
-        "adapter_id": p.get("adapter_id"), "target": p.get("target"), "payload": p.get("payload"),
-        "payload_commitment": p.get("payload_commitment"), "requested_permissions": p.get("requested_permissions"),
-        "amount": p.get("amount"), "unit": p.get("unit"), "effects": p.get("effects"),
-        "authority_context_ref": p.get("authority_context_ref"), "requirement_id": p.get("requirement_id"),
+        "manifest_version": p.get("manifest_version"), "action_id": p.get("action_id"), "adapter_id": p.get("adapter_id"),
+        "target": p.get("target"), "payload": p.get("payload"), "payload_commitment": p.get("payload_commitment"),
+        "requested_permissions": p.get("requested_permissions"), "amount": p.get("amount"), "unit": p.get("unit"),
+        "effects": p.get("effects"), "authority_context_ref": p.get("authority_context_ref"),
+        "requirement_id": p.get("requirement_id"),
     })
-
-
-def validate_replay_source(manifest: dict[str, Any], bundle: dict[str, Any]) -> dict[str, Any]:
-    from agent_replay_bundle.importers import import_bounded_workflow
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for record in bundle.get("records", []):
-        grouped.setdefault(record.get("record_type"), []).append(data(record))
-    proposal = grouped.get("runtime_proposal", [None])[0]
-    cp = {"run_id": bundle.get("run_id"), "decisions": grouped.get("runtime_decision", []), "attempts": grouped.get("control_plane_attempt_transition", []), "observations": grouped.get("effect_observation", []), "reconciliations": grouped.get("reconciliation", [])}
-    has_execution = any(grouped.get(k) for k in ("execution_envelope", "execution_result", "destination_attempt", "destination_effect"))
-    moltbot = None
-    if has_execution:
-        moltbot = {"execution_envelope": grouped.get("execution_envelope", [{}])[0], "execution_result": grouped.get("execution_result", [{}])[0], "attempts": grouped.get("destination_attempt", []), "attempt_events": grouped.get("destination_attempt_event", []), "effects": grouped.get("destination_effect", [])}
-    rec = import_bounded_workflow(cp, proposal=proposal, moltbot_export=moltbot)
-    return {"status": getattr(rec, "status", "unknown")}
 
 
 @dataclass
@@ -186,7 +156,7 @@ class TransactionalExchangeStore:
     def accept_successor(self, packet: dict[str, Any], predecessor: dict[str, Any]) -> dict[str, Any]:
         if packet.get("packet_digest") != digest({k: v for k, v in packet.items() if k != "packet_digest"}):
             return {"loaded": False, "effect_created": False, "status": "packet_digest_mismatch"}
-        if packet.get("source_packet_id") != predecessor.get("message_id") and packet.get("source_packet_id") != predecessor.get("packet_id"):
+        if packet.get("source_packet_id") not in {predecessor.get("message_id"), predecessor.get("packet_id")}:
             return {"loaded": False, "effect_created": False, "status": "source_identity_mismatch"}
         if packet.get("source_commitment") != digest(predecessor):
             return {"loaded": False, "effect_created": False, "status": "source_commitment_mismatch"}
@@ -221,14 +191,12 @@ DurableExchangeStore = TransactionalExchangeStore
 
 
 class MoltbotSqliteDestination:
-    """Local Moltbot-boundary adapter with SQLite durability and CP-compatible apply/observe."""
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path) as con:
             con.execute("create table if not exists effects(effect_id text primary key, grant_id text, operation_digest text, target text, amount real, unit text, payload text, state text)")
             con.execute("create table if not exists grant_counts(grant_id text primary key, count integer not null)")
-            con.execute("create table if not exists attempts(attempt_id text primary key, effect_id text, status text, acknowledgement text)")
 
     def apply(self, *, effect_id: str, grant_id: str, max_effects: int, target: str, amount: float, unit: str, payload: dict, lose_ack: bool = False, partial: bool = False) -> dict[str, Any]:
         op_digest = digest({"target": target, "amount": amount, "unit": unit, "payload": payload})
@@ -237,18 +205,17 @@ class MoltbotSqliteDestination:
             if prior:
                 if prior[0] != op_digest:
                     raise RuntimeError("same effect_id reused with different operation content")
-                effect = {"effect_id": effect_id, "grant_id": grant_id, "target": prior[1], "amount": prior[2], "unit": prior[3], "payload": json.loads(prior[4]), "state": prior[5]}
-                return {"duplicate": True, "effect": effect}
-            used_row = con.execute("select count from grant_counts where grant_id=?", (grant_id,)).fetchone()
-            used = int(used_row[0]) if used_row else 0
-            if used >= max_effects:
+                return {"duplicate": True, "effect": {"effect_id": effect_id, "grant_id": grant_id, "target": prior[1], "amount": prior[2], "unit": prior[3], "payload": json.loads(prior[4]), "state": prior[5]}}
+            used = con.execute("select count from grant_counts where grant_id=?", (grant_id,)).fetchone()
+            count = int(used[0]) if used else 0
+            if count >= max_effects:
                 raise RuntimeError("cumulative grant max_effects exhausted")
-            effect = {"effect_id": effect_id, "grant_id": grant_id, "target": target, "amount": amount, "unit": unit, "payload": copy.deepcopy(payload), "state": "partial" if partial else "applied"}
-            con.execute("insert into effects values(?,?,?,?,?,?,?,?)", (effect_id, grant_id, op_digest, target, amount, unit, json.dumps(payload, sort_keys=True), effect["state"]))
-            con.execute("insert or replace into grant_counts values(?,?)", (grant_id, used + 1))
+            state = "partial" if partial else "applied"
+            con.execute("insert into effects values(?,?,?,?,?,?,?,?)", (effect_id, grant_id, op_digest, target, amount, unit, json.dumps(payload, sort_keys=True), state))
+            con.execute("insert or replace into grant_counts values(?,?)", (grant_id, count + 1))
             if lose_ack:
                 raise TimeoutError("synthetic acknowledgement lost after durable Moltbot commit")
-            return {"duplicate": False, "effect": effect}
+            return {"duplicate": False, "effect": {"effect_id": effect_id, "grant_id": grant_id, "target": target, "amount": amount, "unit": unit, "payload": copy.deepcopy(payload), "state": state}}
 
     def observe(self, effect_id: str):
         EffectObservation = _cp()["EffectObservation"]
@@ -262,8 +229,7 @@ class MoltbotSqliteDestination:
     def snapshot(self) -> dict[str, Any]:
         with sqlite3.connect(self.path) as con:
             rows = con.execute("select effect_id,grant_id,target,amount,unit,payload,state from effects").fetchall()
-            counts = con.execute("select grant_id,count from grant_counts").fetchall()
-        return {"effects": {r[0]: {"effect_id": r[0], "grant_id": r[1], "target": r[2], "amount": r[3], "unit": r[4], "payload": json.loads(r[5]), "state": r[6]} for r in rows}, "grant_effect_counts": {r[0]: r[1] for r in counts}}
+        return {"effects": {r[0]: {"effect_id": r[0], "grant_id": r[1], "target": r[2], "amount": r[3], "unit": r[4], "payload": json.loads(r[5]), "state": r[6]} for r in rows}}
 
 
 @dataclass
@@ -271,42 +237,29 @@ class DestinationState:
     path: Path | None = None
     _tmp: tempfile.TemporaryDirectory | None = field(default=None, init=False, repr=False)
     _destination: Any = field(default=None, init=False, repr=False)
-
     def __post_init__(self) -> None:
         if self.path is None:
-            self._tmp = tempfile.TemporaryDirectory()
-            self.path = Path(self._tmp.name) / "moltbot_destination.sqlite"
+            self._tmp = tempfile.TemporaryDirectory(); self.path = Path(self._tmp.name) / "moltbot_destination.sqlite"
         self._destination = MoltbotSqliteDestination(self.path)
-
     @property
-    def adapter(self) -> MoltbotSqliteDestination:
-        return self._destination
-
+    def adapter(self) -> MoltbotSqliteDestination: return self._destination
     @property
-    def effects(self) -> dict[str, Any]:
-        return copy.deepcopy(self._destination.snapshot().get("effects", {}))
-
-    def snapshot(self) -> dict[str, Any]:
-        return self._destination.snapshot()
+    def effects(self) -> dict[str, Any]: return copy.deepcopy(self._destination.snapshot()["effects"])
+    def snapshot(self) -> dict[str, Any]: return self._destination.snapshot()
 
 
-def _fixed_resolver(proposal: Any, *, now: datetime, active: bool = True, include_grant: bool = True):
-    cp = _cp(); C = cp["commitment"]
-    ctx = {"schema_version": "0.1.0", "interface_status": "proposed_pending_governor_review", "context_id": "urn:cognous:authority-context:pilot-1", "institution": {"institution_id": INSTITUTION, "authority_domain": "customer-refunds", "authority_basis_ref": "urn:cognous:authority-basis:synthetic", "authority_mode": "principle_inspired"}, "principal": TRUSTED_PRINCIPAL, "acting_identity": TRUSTED_ACTOR, "requirement": {"requirement_id": proposal.requirement_id, "governing_sources": [{"ref": POLICY_REF, "version": POLICY_VERSION}], "permissions": [{"action": "refund_issue_routine", "targets": [TRUSTED_TARGET], "data_scopes": [TRUSTED_PERMISSION], "max_amount": 100.0, "unit": "USD", "max_effects": 1}], "approvals": [{"role_id": "urn:cognous:role:customer-service-supervisor", "independent_of_actor": True}], "evidence": [{"obligation_id": "urn:cognous:evidence:refund-entitlement", "kind": "authorization", "source_ref": "urn:cognous:source:entitlement", "max_age_seconds": 300, "required": True, "unknown_behavior": "hold_effect"}], "consequence": {"tier": "T1"}}, "conflicts": {"precedence_refs": [POLICY_REF]}, "supporting_evidence_refs": []}
-    if include_grant:
-        ctx["grant"] = {"grant_id": TRUSTED_GRANT_ID, "revision": "1", "requirement_id": proposal.requirement_id, "issuer": ISSUER, "issuer_role": ISSUER_ROLE, "issuance_record_ref": "urn:cognous:issuance:1", "grantee": TRUSTED_PRINCIPAL, "acting_identity": TRUSTED_ACTOR, "issued_at": now.isoformat(), "not_before": now.isoformat(), "expires_at": "2026-08-09T00:00:00+00:00", "status_ref": "urn:cognous:status:grant-1", "policy_versions": [{"ref": POLICY_REF, "version": POLICY_VERSION}], "permissions": [{"action": "refund_issue_routine", "targets": [TRUSTED_TARGET], "data_scopes": [TRUSTED_PERMISSION], "max_amount": 100.0, "unit": "USD", "max_effects": 1}], "delegation": {"parent_grant_id": None, "may_delegate": False, "remaining_depth": 0}, "approval_refs": ["urn:cognous:approval:t1-1"]}
+def _build_resolver(proposal: Any, *, now: datetime | None = None, active: bool = True, include_grant: bool = True):
+    cp = _cp(); C = cp["commitment"]; now = now or parse_time(EVAL)
+    ctx = {"schema_version": "0.1.0", "interface_status": "proposed_pending_governor_review", "context_id": PROFILE_AUTH_CONTEXT, "institution": {"institution_id": INSTITUTION, "authority_domain": "customer-refunds", "authority_basis_ref": "urn:cognous:authority-basis:synthetic", "authority_mode": "principle_inspired"}, "principal": TRUSTED_PRINCIPAL, "acting_identity": TRUSTED_ACTOR, "requirement": {"requirement_id": proposal.requirement_id, "governing_sources": [{"ref": POLICY_REF, "version": POLICY_VERSION}], "permissions": [{"action": "refund_issue_routine", "targets": [TRUSTED_TARGET], "data_scopes": [TRUSTED_PERMISSION], "max_amount": 100.0, "unit": "USD", "max_effects": 1}], "approvals": [{"role_id": "urn:cognous:role:customer-service-supervisor", "independent_of_actor": True}], "evidence": [{"obligation_id": "urn:cognous:evidence:refund-entitlement", "kind": "authorization", "source_ref": "urn:cognous:source:entitlement", "max_age_seconds": 300, "required": True, "unknown_behavior": "hold_effect"}], "consequence": {"tier": "T1"}}, "conflicts": {"precedence_refs": [POLICY_REF]}, "supporting_evidence_refs": []}
     statuses = {}; approvals = {}; mandates = {}
     if include_grant:
+        ctx["grant"] = {"grant_id": TRUSTED_GRANT_ID, "revision": "1", "requirement_id": proposal.requirement_id, "issuer": ISSUER, "issuer_role": ISSUER_ROLE, "issuance_record_ref": "urn:cognous:issuance:1", "grantee": TRUSTED_PRINCIPAL, "acting_identity": TRUSTED_ACTOR, "issued_at": now.isoformat(), "not_before": now.isoformat(), "expires_at": "2026-08-09T00:00:00+00:00", "status_ref": "urn:cognous:status:grant-1", "policy_versions": [{"ref": POLICY_REF, "version": POLICY_VERSION}], "permissions": [{"action": "refund_issue_routine", "targets": [TRUSTED_TARGET], "data_scopes": [TRUSTED_PERMISSION], "max_amount": 100.0, "unit": "USD", "max_effects": 1}], "delegation": {"parent_grant_id": None, "may_delegate": False, "remaining_depth": 0}, "approval_refs": ["urn:cognous:approval:t1-1"]}
         statuses[TRUSTED_GRANT_ID] = cp["GrantStatus"](grant_id=TRUSTED_GRANT_ID, revision="1", status="active" if active else "revoked", observed_at=now.isoformat(), version="status-v1", status_ref="urn:cognous:status:grant-1", authority_basis_ref="urn:cognous:authority-basis:synthetic", institution_id=INSTITUTION, authority_domain="customer-refunds")
         approvals["urn:cognous:approval:t1-1"] = cp["ApprovalStatus"](approval_ref="urn:cognous:approval:t1-1", role_id="urn:cognous:role:customer-service-supervisor", approver="urn:cognous:principal:reviewer-1", grant_id=TRUSTED_GRANT_ID, grant_revision="1", proposal_commitment=C(proposal.model_dump(mode="json", exclude_none=False)), policy_versions=[{"ref": POLICY_REF, "version": POLICY_VERSION}], observed_at=now.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds")
         mandates[f"{ISSUER}|{ISSUER_ROLE}"] = cp["MandateStatus"](issuer=ISSUER, issuer_role=ISSUER_ROLE, issuance_record_ref="urn:cognous:issuance:1", mandate_valid=True, observed_at=now.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds")
     aliases = {"customer-service-supervisor": ["urn:cognous:role:customer-service-supervisor"]}
     mapping = cp["RoleMappingStatus"](institution_id=INSTITUTION, version="roles-v1", digest=C({"institution_id": INSTITUTION, "version": "roles-v1", "aliases": aliases}), aliases=aliases)
     return cp["SyntheticResolver"](contexts={PROFILE_AUTH_CONTEXT: ctx}, statuses=statuses, identities={TRUSTED_ACTOR: cp["IdentityStatus"](identity=TRUSTED_ACTOR, principal=TRUSTED_PRINCIPAL, authenticated=True, delegation_valid=True, observed_at=now.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds")}, mandates=mandates, approvals=approvals, policies={POLICY_REF: cp["PolicyStatus"](ref=POLICY_REF, version=POLICY_VERSION, status="active", observed_at=now.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds")}, conflicts={proposal.requirement_id: cp["ConflictStatus"](requirement_id=proposal.requirement_id, state="clear", observed_at=now.isoformat(), conflict_refs=[POLICY_REF], institution_id=INSTITUTION, authority_domain="customer-refunds")}, evidence={"urn:cognous:evidence:refund-entitlement": cp["EvidenceStatus"](obligation_id="urn:cognous:evidence:refund-entitlement", state="current", observed_at=now.isoformat(), source_ref="urn:cognous:source:entitlement", institution_id=INSTITUTION, authority_domain="customer-refunds")}, role_mappings={INSTITUTION: mapping})
-
-
-def _build_resolver(proposal: Any, *, now: datetime | None = None, active: bool = True, include_grant: bool = True):
-    return _fixed_resolver(proposal, now=now or parse_time(EVAL), active=active, include_grant=include_grant)
 
 
 def make_message(bundle: dict[str, Any], *, message_id: str = "msg-refund-001", recipient: str = "refund-recipient", sender: str = "refund-sender", message_type: str = "PROPOSE", created_at: str = "2026-08-08T00:00:00Z", expires_at: str = "2026-08-09T00:00:00Z") -> dict[str, Any]:
@@ -318,40 +271,28 @@ def make_message(bundle: dict[str, Any], *, message_id: str = "msg-refund-001", 
 
 
 def assess_message(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, *, evaluation_time: str, seen_messages: dict[str, str] | None = None) -> dict[str, Any]:
-    stages: dict[str, str] = {}; errors: list[str] = []
-    def fail(stage: str, code: str, handling: str = "REFUSE") -> dict[str, Any]:
+    stages = {}; errors = []
+    def fail(stage: str, code: str, handling: str = "REFUSE"):
         stages[stage] = "failed"; errors.append(code)
         return {"permitted_handling": handling, "stages": stages, "errors": errors, "message_received": True, "message_understood": stage not in {"structure", "profile"}}
     required = ["message_id", "conversation_id", "profile", "protocol_version", "message_type", "created_at", "expires_at", "sender", "recipient", "purpose", "requested_action", "operation_commitment", "proposal_commitment", "authority_refs", "evidence_refs", "content", "content_digest", "message_digest"]
-    if any(k not in message for k in required):
-        return fail("structure", "GAX-SCHEMA-MISSING-REQUIRED", "NOT_UNDERSTOOD")
-    if message["message_digest"] != digest({k: v for k, v in message.items() if k != "message_digest"}) or message["content_digest"] != digest(message["content"]):
-        return fail("structure", "GAX-INTEGRITY-DIGEST", "NOT_UNDERSTOOD")
+    if any(k not in message for k in required): return fail("structure", "GAX-SCHEMA-MISSING-REQUIRED", "NOT_UNDERSTOOD")
+    if message["message_digest"] != digest({k: v for k, v in message.items() if k != "message_digest"}) or message["content_digest"] != digest(message["content"]): return fail("structure", "GAX-INTEGRITY-DIGEST", "NOT_UNDERSTOOD")
     stages["structure"] = "passed"
-    if message["profile"] != PROFILE or message["protocol_version"] != PROTOCOL_VERSION or message["message_type"] not in SUPPORTED_TYPES:
-        return fail("profile", "GAX-PROFILE-UNSUPPORTED-OR-DOWNGRADE", "NOT_UNDERSTOOD")
+    if message["profile"] != PROFILE or message["protocol_version"] != PROTOCOL_VERSION or message["message_type"] not in SUPPORTED_TYPES: return fail("profile", "GAX-PROFILE-UNSUPPORTED-OR-DOWNGRADE", "NOT_UNDERSTOOD")
     stages["profile"] = "passed"
     prior = (seen_messages or {}).get(message["message_id"])
-    if prior and prior != message["message_digest"]:
-        return fail("identity_binding", "GAX-INTEGRITY-MESSAGE-ID-REUSE")
-    if not registry.sender_trusted(message["sender"]):
-        return fail("identity_binding", "GAX-IDENTITY-SENDER-UNTRUSTED")
-    if message["recipient"] != registry.recipient or not registry.recipient_known(message["recipient"]):
-        return fail("identity_binding", "GAX-IDENTITY-WRONG-RECIPIENT")
+    if prior and prior != message["message_digest"]: return fail("identity_binding", "GAX-INTEGRITY-MESSAGE-ID-REUSE")
+    if not registry.sender_trusted(message["sender"]): return fail("identity_binding", "GAX-IDENTITY-SENDER-UNTRUSTED")
+    if message["recipient"] != registry.recipient or not registry.recipient_known(message["recipient"]): return fail("identity_binding", "GAX-IDENTITY-WRONG-RECIPIENT")
     stages["identity_binding"] = "passed"
-    if message["purpose"] != registry.relying_purpose:
-        return fail("purpose", "GAX-PURPOSE-UNSUPPORTED")
-    if parse_time(message["expires_at"]) <= parse_time(evaluation_time):
-        return fail("freshness", "GAX-FRESHNESS-EXPIRED")
+    if message["purpose"] != registry.relying_purpose: return fail("purpose", "GAX-PURPOSE-UNSUPPORTED")
+    if parse_time(message["expires_at"]) <= parse_time(evaluation_time): return fail("freshness", "GAX-FRESHNESS-EXPIRED")
     stages["freshness"] = "passed"
-    proposal = runtime_proposal_model(bundle)
-    p = proposal.model_dump(mode="json", exclude_none=False)
-    req = message["requested_action"]
+    proposal = runtime_proposal_model(bundle); p = proposal.model_dump(mode="json", exclude_none=False)
     expected_req = {"action_id": p["action_id"], "target": p["target"], "payload": p["payload"], "amount": p["amount"], "unit": p["unit"], "actor": p["actor"], "principal": p["principal"], "adapter_id": p["adapter_id"], "requested_permissions": p["requested_permissions"]}
-    if req != expected_req or message["proposal_commitment"] != proposal_commitment(model=proposal) or message["operation_commitment"] != operation_commitment(model=proposal):
-        return fail("reference_resolution", "GAX-REFERENCE-OPERATION-BINDING-MISMATCH")
-    if not any(r.get("ref") == p.get("authority_context_ref") for r in message["authority_refs"]):
-        return fail("authority_reference", "GAX-AUTHORITY-REFERENCE-MISMATCH")
+    if message["requested_action"] != expected_req or message["proposal_commitment"] != proposal_commitment(model=proposal) or message["operation_commitment"] != operation_commitment(model=proposal): return fail("reference_resolution", "GAX-REFERENCE-OPERATION-BINDING-MISMATCH")
+    if not any(r.get("ref") == p.get("authority_context_ref") for r in message["authority_refs"]): return fail("authority_reference", "GAX-AUTHORITY-REFERENCE-MISMATCH")
     stages["reference_resolution"] = "passed"; stages["authority_reference"] = "present_not_authorizing"
     if message["message_type"] in INFORMATIONAL_TYPES:
         stages["communicative_act"] = "informational_no_effect"
@@ -364,28 +305,38 @@ def _model_dict(value: Any) -> dict[str, Any]:
     return value.model_dump(mode="json", exclude_none=False) if hasattr(value, "model_dump") else dict(value)
 
 
+def _operation_for_replay(proposal: Any, decision: Any) -> dict[str, Any]:
+    p = _model_dict(proposal); d = _model_dict(decision); binding = d.get("binding") or {}
+    op = {k: p.get(k) for k in ("actor", "principal", "manifest_id", "manifest_version", "manifest_digest", "action_id", "adapter_id", "target", "payload", "payload_commitment", "requested_permissions", "amount", "unit", "effects", "requirement_id")}
+    op["authority_context_id"] = p.get("authority_context_ref")
+    op["proposal_commitment"] = proposal_commitment(model=proposal)
+    op["grant_id"] = binding.get("grant_id")
+    op["grant_revision"] = binding.get("grant_revision")
+    op["effective_max_effects"] = binding.get("effective_max_effects") or 1
+    op["institution_id"] = binding.get("institution_id", INSTITUTION)
+    op["authority_domain"] = binding.get("authority_domain", "customer-refunds")
+    return op
+
+
 def _reconstruction_from_run(manifest: dict[str, Any], proposal: Any, decision: Any, record: Any, destination: DestinationState, *, original_bundle: dict[str, Any], decision_source: str = "current_control_plane") -> dict[str, Any]:
     p = _model_dict(proposal); d = _model_dict(decision)
     attempts = [_model_dict(a) for a in record.attempts]
     observations = [_model_dict(o) for o in record.observations]
-    effect_id = d.get("effect_id")
-    dest_effect = destination.effects.get(effect_id, {}) if effect_id else {}
-    operation = copy.deepcopy(p); operation["proposal_commitment"] = proposal_commitment(model=proposal); operation["operation_digest"] = operation_commitment(model=proposal)
-    recs = [
-        {"record_id": "current-runtime-proposal", "record_type": "runtime_proposal", "producer_profile_id": "control-plane", "data": p},
-        {"record_id": "current-runtime-decision", "record_type": "runtime_decision", "producer_profile_id": "control-plane", "data": d},
-    ]
+    effect_id = d.get("effect_id"); dest_effect = destination.effects.get(effect_id, {}) if effect_id else {}
+    recs = [{"record_id": "current-runtime-proposal", "record_type": "runtime_proposal", "producer_profile_id": "control-plane", "data": p}, {"record_id": "current-runtime-decision", "record_type": "runtime_decision", "producer_profile_id": "control-plane", "data": d}]
     if d.get("result") == "authorized" and attempts:
+        op = _operation_for_replay(proposal, decision); op_digest = digest(op); aid = attempts[-1]["attempt_id"]
+        obs = observations[-1] if observations else {"effect_id": effect_id, "state": "unknown"}
         recs += [
             {"record_id": "current-control-plane-attempt", "record_type": "control_plane_attempt_transition", "producer_profile_id": "control-plane", "data": attempts[-1]},
-            {"record_id": "current-execution-envelope", "record_type": "execution_envelope", "producer_profile_id": "moltbot-safe", "data": {"envelope_id": "env-" + effect_id, "operation": operation}},
-            {"record_id": "current-destination-attempt", "record_type": "destination_attempt", "producer_profile_id": "moltbot-safe", "data": {"attempt_id": attempts[-1]["attempt_id"], "effect_id": effect_id, "decision_id": d.get("decision_id"), "operation_digest": operation_commitment(model=proposal)}},
-            {"record_id": "current-execution-result", "record_type": "execution_result", "producer_profile_id": "moltbot-safe", "data": {"attempt_id": attempts[-1]["attempt_id"], "effect_id": effect_id, "decision_id": d.get("decision_id"), "status": attempts[-1].get("status"), "acknowledged": attempts[-1].get("status") == "acknowledged", "newly_executed": not bool(attempts[-1].get("acknowledgement", {}).get("duplicate")), "observed_state": observations[-1].get("state") if observations else "unknown"}},
+            {"record_id": "current-execution-envelope", "record_type": "execution_envelope", "producer_profile_id": "moltbot-safe", "data": {"version": "0.2.0", "envelope_id": "env-" + effect_id, "decision_id": d.get("decision_id"), "effect_id": effect_id, "attempt_id": aid, "operation": op}},
+            {"record_id": "current-destination-attempt", "record_type": "destination_attempt", "producer_profile_id": "moltbot-safe", "data": {"attempt_id": aid, "effect_id": effect_id, "decision_id": d.get("decision_id"), "operation_digest": op_digest, "status": attempts[-1].get("status")}},
+            {"record_id": "current-execution-result", "record_type": "execution_result", "producer_profile_id": "moltbot-safe", "data": {"attempt_id": aid, "effect_id": effect_id, "decision_id": d.get("decision_id"), "status": attempts[-1].get("status"), "acknowledged": attempts[-1].get("status") == "acknowledged", "newly_executed": not bool(attempts[-1].get("acknowledgement", {}).get("duplicate")), "observed_state": obs.get("state", "unknown"), "observation": obs}},
         ]
         if dest_effect:
-            recs.append({"record_id": "current-destination-effect", "record_type": "destination_effect", "producer_profile_id": "moltbot-safe", "data": {"effect_id": effect_id, "target": dest_effect.get("target"), "amount": dest_effect.get("amount"), "unit": dest_effect.get("unit"), "payload_json": json.dumps(dest_effect.get("payload"), sort_keys=True), "operation_digest": operation_commitment(model=proposal), "state": dest_effect.get("state")}})
-        for idx, obs in enumerate(observations):
-            recs.append({"record_id": f"current-effect-observation-{idx}", "record_type": "effect_observation", "producer_profile_id": "control-plane", "data": obs})
+            recs.append({"record_id": "current-destination-effect", "record_type": "destination_effect", "producer_profile_id": "moltbot-safe", "data": {"effect_id": effect_id, "operation_digest": op_digest, "grant_id": op.get("grant_id"), "target": dest_effect.get("target"), "amount": dest_effect.get("amount"), "unit": dest_effect.get("unit"), "payload_json": json.dumps(dest_effect.get("payload"), sort_keys=True, separators=(",", ":")), "state": dest_effect.get("state")}})
+        for idx, o in enumerate(observations):
+            recs.append({"record_id": f"current-effect-observation-{idx}", "record_type": "effect_observation", "producer_profile_id": "control-plane", "data": o})
     return {"reconstruction_bundle_version": "0.2.0", "bundle_id": "gax-imx-current-" + digest({"decision": d})[7:19], "run_id": record.run_id, "producer_profiles": [{"profile_id": "control-plane", "repository": "cogno-us/cognous-agent-control-plane", "revision": "283500652d47a692fb0b99a1172a6d5faffbd9a7"}, {"profile_id": "moltbot-safe", "repository": "cogno-us/moltbot-safe", "revision": "6b0ba1185bcd390f71df947dda349415e4105f5f"}], "records": recs, "input_history": {"bundle_digest": digest(original_bundle), "preserved_as_history_only": True}, "decision_source": decision_source}
 
 
@@ -398,8 +349,7 @@ def execution_facts(bundle: dict[str, Any]) -> dict[str, Any]:
 
 def _run_replay(bundle: dict[str, Any]) -> dict[str, Any]:
     grouped: dict[str, list[dict[str, Any]]] = {}
-    for r in bundle.get("records", []):
-        grouped.setdefault(r["record_type"], []).append(data(r))
+    for r in bundle.get("records", []): grouped.setdefault(r["record_type"], []).append(data(r))
     from agent_replay_bundle.importers import import_bounded_workflow
     cp = {"run_id": bundle.get("run_id"), "decisions": grouped.get("runtime_decision", []), "attempts": grouped.get("control_plane_attempt_transition", []), "observations": grouped.get("effect_observation", []), "reconciliations": grouped.get("reconciliation", [])}
     proposal = grouped.get("runtime_proposal", [None])[0]
@@ -415,43 +365,32 @@ def export_odes_reference(manifest: dict[str, Any], bundle: dict[str, Any]) -> d
     package = export_cognous_stack_package(manifest, bundle, relying_party="recipient.example.org", purpose="audit", expires_at="2027-01-01T00:00:00Z")
     package.setdefault("provenance", {})["execution_facts"] = execution_facts(bundle)
     policy = {"now": "2026-10-06T00:00:00Z", "purpose": "audit", "relying_party": "recipient.example.org", "status_inputs": {}, "supported_profiles": ["odes_cognous_stack_export_0_1"], "trusted_digests": [], "trusted_key_refs": [], "evaluation_scope": "audit", "status_max_age_seconds": 300}
-    validation = evaluate_recipient_package(package, policy)
-    return {"odes_package": package, "recipient_validation": validation}
+    return {"odes_package": package, "recipient_validation": evaluate_recipient_package(package, policy)}
 
 
 def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: DestinationState, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False) -> dict[str, Any]:
-    if resolver is None:
-        raise ValueError("trusted resolver is required; incoming proposals never construct authority")
-    store = TransactionalExchangeStore(store_path)
-    duplicate, err = store.record_message(message)
-    if err:
-        return {"assessment": {"permitted_handling": "REFUSE", "errors": [err], "stages": {"identity_binding": "failed"}}, "execution": {"attempted": False, "reason": err}}
+    if resolver is None: raise ValueError("trusted resolver is required; incoming proposals never construct authority")
+    store = TransactionalExchangeStore(store_path); duplicate, err = store.record_message(message)
+    if err: return {"assessment": {"permitted_handling": "REFUSE", "errors": [err], "stages": {"identity_binding": "failed"}}, "execution": {"attempted": False, "reason": err}}
     assessment = assess_message(message, bundle, registry, evaluation_time=evaluation_time, seen_messages=store.seen_messages())
-    if assessment["permitted_handling"] != "ACCEPT_FOR_ASSESSMENT":
-        return {"assessment": assessment, "execution": {"attempted": False, "reason": "message_not_execution_eligible"}}
-    proposal = runtime_proposal_model(bundle)
-    op_hash = operation_commitment(model=proposal)
-    cp = _cp(); record_store = cp["BoundedRecordStore"]((Path(store_path).parent / "control_plane_run.json"), proposal.run_id or "run-gax-imx")
+    if assessment["permitted_handling"] != "ACCEPT_FOR_ASSESSMENT": return {"assessment": assessment, "execution": {"attempted": False, "reason": "message_not_execution_eligible"}}
+    proposal = runtime_proposal_model(bundle); op_hash = operation_commitment(model=proposal); cp = _cp()
+    record_store = cp["BoundedRecordStore"]((Path(store_path).parent / "control_plane_run.json"), proposal.run_id or "run-gax-imx")
     flow = cp["BoundedAuthorizationWorkflow"](manifest=manifest, resolver=resolver, destination=destination.adapter, records=record_store)
     decision = flow.decide(proposal, now=parse_time(evaluation_time))
     if decision.result != "authorized":
         assessment["stages"]["authority"] = decision.result
         return {"assessment": assessment, "execution": {"attempted": False, "reason": ";".join(decision.reasons), "decision_id": decision.decision_id}, "current_reconstruction_bundle": _reconstruction_from_run(manifest, proposal, decision, record_store.load(), destination, original_bundle=bundle)}
-    if mutate_resolver_after_decision:
-        mutate_resolver_after_decision(resolver)
+    if mutate_resolver_after_decision: mutate_resolver_after_decision(resolver)
     same_effect, err = store.bind_effect(decision.effect_id, op_hash)
     if err:
-        assessment["errors"].append(err)
-        return {"assessment": assessment, "execution": {"attempted": False, "reason": err, "effect_id": decision.effect_id}}
+        assessment["errors"].append(err); return {"assessment": assessment, "execution": {"attempted": False, "reason": err, "effect_id": decision.effect_id}}
     try:
         attempt, observed = flow.execute(proposal, decision, adapter_id=proposal.adapter_id, now=parse_time(evaluation_time), lose_ack=lose_ack, partial=partial_delivery)
     except Exception as exc:
         return {"assessment": assessment, "execution": {"attempted": False, "reason": str(exc), "effect_id": decision.effect_id}}
     current = _reconstruction_from_run(manifest, proposal, decision, record_store.load(), destination, original_bundle=bundle)
-    replay = _run_replay(current)
-    odes = export_odes_reference(manifest, current)
-    facts = execution_facts(current)
-    successor = make_successor_packet(message, facts=facts, state_version=1, current_bundle=current)
+    replay = _run_replay(current); odes = export_odes_reference(manifest, current); facts = execution_facts(current); successor = make_successor_packet(message, facts=facts, state_version=1, current_bundle=current)
     assessment["stages"]["authority"] = "authorized"
     return {"assessment": assessment, "execution": {"attempted": True, "attempt_status": attempt.status, "newly_executed": not same_effect and not attempt.acknowledgement.get("duplicate", False), "destination_observed": observed.state, "effect_id": decision.effect_id, "decision_id": decision.decision_id, "attempt_id": attempt.attempt_id}, "current_reconstruction_bundle": current, "replay_validation": replay, "odes_reference": odes, "successor_packet": successor}
 
