@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 TRANSPORT_PROFILE = "urn:cognous:profiles:governed-message-transport:0.1.0"
-TRANSPORT_VERSION = "0.1.0"
+TRANSPORT_VERSION = "0.2.0"
 CANONICALIZATION_VERSION = "json-sort-keys-compact-v1"
 ACK_KIND_DURABLE_RECEIPT = "DURABLE_RECEIPT"
 ACK_KIND_DURABLE_RECEIPT_UNRESOLVED = "DURABLE_RECEIPT_UNRESOLVED"
@@ -183,12 +183,14 @@ class RecipientOutcome:
     assessment: dict[str, Any]
     execution: dict[str, Any]
     producer_refs: dict[str, Any]
+    result_export: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "assessment": copy.deepcopy(self.assessment),
             "execution": copy.deepcopy(self.execution),
             "producer_refs": copy.deepcopy(self.producer_refs),
+            "result_export": copy.deepcopy(self.result_export),
         }
 
 
@@ -279,20 +281,45 @@ class AcceptedGaxRecipientAdapter:
             resolver=self.resolver,
         )
         execution = copy.deepcopy(result.get("execution") or {})
+        result_export = copy.deepcopy(result.get("gax_result_export"))
+        export_refs = (
+            copy.deepcopy(result_export.get("producer_refs") or {})
+            if isinstance(result_export, dict)
+            else {}
+        )
         producer_refs = {
-            "decision_id": execution.get("decision_id"),
-            "effect_id": execution.get("effect_id"),
-            "executor_attempt_id": execution.get("attempt_id"),
-            "reconstruction_bundle_id": (
-                (result.get("current_reconstruction_bundle") or {}).get("bundle_id")
+            "decision_id": execution.get("decision_id") or export_refs.get("decision_id"),
+            "effect_id": execution.get("effect_id") or export_refs.get("effect_id"),
+            "executor_attempt_id": execution.get("attempt_id") or export_refs.get("executor_attempt_id"),
+            "reconstruction_bundle_id": export_refs.get("reconstruction_bundle_id"),
+            "odes_package_digest": export_refs.get("odes_package_digest"),
+            "successor_packet_id": export_refs.get("successor_packet_id"),
+            "gax_result_export_version": (
+                result_export.get("export_version")
+                if isinstance(result_export, dict)
+                else None
             ),
-            "successor_packet_id": (result.get("successor_packet") or {}).get("packet_id"),
+            "artifact_retention_state": (
+                result_export.get("retention_state")
+                if isinstance(result_export, dict)
+                else result.get("artifact_retention_state")
+            ),
         }
         return RecipientOutcome(
             assessment=copy.deepcopy(result.get("assessment") or assessment),
             execution=execution,
             producer_refs={k: v for k, v in producer_refs.items() if v is not None},
+            result_export=result_export,
         )
+
+    def recover(self, message: dict[str, Any], *, delivery_time: str) -> RecipientOutcome:
+        """Recover a durable transport receipt through GAX idempotent redelivery.
+
+        GAX decides whether retained originals or explicit derivatives are
+        available. This path never grants authority and never bypasses GAX
+        effect identity/deduplication.
+        """
+        return self.handle(message, delivery_time=delivery_time)
 
 
 class TransportStore:
@@ -328,6 +355,13 @@ class TransportStore:
                     assessment_json TEXT,
                     execution_json TEXT,
                     producer_refs_json TEXT
+                );
+                CREATE TABLE IF NOT EXISTS recipient_result_exports (
+                    message_id TEXT PRIMARY KEY,
+                    export_version TEXT NOT NULL,
+                    retention_state TEXT NOT NULL,
+                    export_commitment TEXT NOT NULL,
+                    export_json TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS attempts (
                     attempt_id TEXT PRIMARY KEY,
@@ -524,6 +558,24 @@ class TransportStore:
 
     def record_recipient_outcome(self, message_id: str, outcome: RecipientOutcome) -> None:
         payload = outcome.as_dict()
+        result_export = payload.get("result_export")
+        encoded_export = None
+        export_commitment = None
+        if result_export is not None:
+            encoded_export = json.dumps(
+                result_export,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            export_commitment = commitment(result_export)
+            export_version = result_export.get("export_version")
+            retention_state = result_export.get("retention_state")
+            if not isinstance(export_version, str) or not export_version:
+                raise ValueError("recipient result export lacks version")
+            if not isinstance(retention_state, str) or not retention_state:
+                raise ValueError("recipient result export lacks retention state")
         with sqlite3.connect(self.path, isolation_level="IMMEDIATE") as con:
             con.execute(
                 """
@@ -538,6 +590,45 @@ class TransportStore:
                     message_id,
                 ),
             )
+            if result_export is not None:
+                prior = con.execute(
+                    "SELECT export_commitment,export_json FROM recipient_result_exports WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+                if prior is not None and (
+                    prior[0] != export_commitment or prior[1] != encoded_export
+                ):
+                    raise ValueError("retained recipient result export cannot be replaced")
+                con.execute(
+                    """INSERT OR IGNORE INTO recipient_result_exports(
+                        message_id,export_version,retention_state,export_commitment,export_json
+                    ) VALUES(?,?,?,?,?)""",
+                    (
+                        message_id,
+                        result_export["export_version"],
+                        result_export["retention_state"],
+                        export_commitment,
+                        encoded_export,
+                    ),
+                )
+
+    def result_export(self, message_id: str) -> dict[str, Any] | None:
+        with sqlite3.connect(self.path) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                "SELECT * FROM recipient_result_exports WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        export = json.loads(row["export_json"])
+        if row["export_commitment"] != commitment(export):
+            raise ValueError("retained recipient result export commitment mismatch")
+        if export.get("export_version") != row["export_version"]:
+            raise ValueError("retained recipient result export version mismatch")
+        if export.get("retention_state") != row["retention_state"]:
+            raise ValueError("retained recipient result export state mismatch")
+        return export
 
     def prior_outcome(self, message_id: str) -> RecipientOutcome | None:
         row = self.inbox_record(message_id)
@@ -547,6 +638,7 @@ class TransportStore:
             assessment=json.loads(row["assessment_json"]),
             execution=json.loads(row["execution_json"] or "{}"),
             producer_refs=json.loads(row["producer_refs_json"] or "{}"),
+            result_export=self.result_export(message_id),
         )
 
     def record_ack(self, ack: dict[str, Any]) -> None:
@@ -845,10 +937,20 @@ class LocalDurableTransport:
         else:
             outcome = self.recipient_store.prior_outcome(message["message_id"])
             if outcome is None:
-                return self._unresolved_receipt_ack(
-                    envelope,
-                    now=trusted_now,
-                    reason="durable_receipt_without_recipient_outcome",
+                recover = getattr(self.recipient_handler, "recover", None)
+                if recover is None:
+                    return self._unresolved_receipt_ack(
+                        envelope,
+                        now=trusted_now,
+                        reason="durable_receipt_without_recipient_outcome",
+                    )
+                outcome = recover(
+                    copy.deepcopy(message),
+                    delivery_time=trusted_now,
+                )
+                self.recipient_store.record_recipient_outcome(
+                    message["message_id"],
+                    outcome,
                 )
 
         return self._ack(
@@ -1093,6 +1195,7 @@ class LocalDurableTransport:
             )
         if inbox and inbox.get("producer_refs_json"):
             producer_refs = json.loads(inbox["producer_refs_json"])
+        retained_export = self.recipient_store.result_export(message_id) if inbox else None
         return {
             "transport_profile": TRANSPORT_PROFILE,
             "transport_version": TRANSPORT_VERSION,
@@ -1129,6 +1232,12 @@ class LocalDurableTransport:
                 for row in recipient_acks
             ],
             "producer_refs": producer_refs,
+            "result_export": {
+                "retained": retained_export is not None,
+                "export_version": retained_export.get("export_version") if retained_export else None,
+                "retention_state": retained_export.get("retention_state") if retained_export else None,
+                "artifact_commitments": copy.deepcopy(retained_export.get("artifact_commitments")) if retained_export else None,
+            },
             "namespace_rule": (
                 "transport_attempt_id is transport-owned; decision_id, effect_id and "
                 "executor_attempt_id are linked only when returned by the recipient producer"
