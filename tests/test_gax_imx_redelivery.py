@@ -7,12 +7,16 @@ from pathlib import Path
 
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     LocalRegistry,
-    _build_resolver,
-    load_actual_pinned_moltbot_helpers,
+    load_executor_runtime,
     make_message,
     parse_time,
     run_exchange,
     runtime_proposal_model,
+)
+
+from experiments.odex_gax_imx_reference.synthetic_fixture import (
+    build_synthetic_resolver,
+    synthetic_refund_policy,
 )
 
 EVAL = "2026-08-08T01:00:00Z"
@@ -38,12 +42,12 @@ def registry() -> LocalRegistry:
 
 def resolver_for(bundle: dict | None = None):
     proposal = runtime_proposal_model(bundle or success_bundle())
-    return _build_resolver(proposal, now=parse_time(EVAL))
+    return build_synthetic_resolver(proposal, now=parse_time(EVAL))
 
 
 def destination_at(tmp_path: Path):
-    h = load_actual_pinned_moltbot_helpers()
-    return h.DurableRefundDestination(tmp_path / "moltbot-state")
+    runtime = load_executor_runtime()
+    return runtime["DurableRefundDestination"](tmp_path / "moltbot-state")
 
 
 def effect_rows(destination):
@@ -91,6 +95,8 @@ def run_success(tmp_path: Path, *, message_id: str = "m-success", destination=No
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
     )
     return msg, destination, result
 
@@ -105,6 +111,7 @@ def redeliver(tmp_path: Path, msg: dict, destination, *, partial_delivery: bool 
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver or resolver_for(),
+        execution_policy_factory=synthetic_refund_policy,
         partial_delivery=partial_delivery,
         lose_ack=lose_ack,
     )
@@ -142,6 +149,8 @@ def test_partial_delivery_exact_redelivery_preserves_pending_and_unresolved(tmp_
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
         partial_delivery=True,
     )
     original_effect = first["execution"]["effect_id"]
@@ -169,6 +178,8 @@ def test_lost_ack_exact_redelivery_preserves_unknown_unresolved_without_second_e
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
         lose_ack=True,
     )
     original_effect = first["execution"]["effect_id"]
@@ -200,6 +211,8 @@ def test_receipt_then_failure_before_effect_redelivery_returns_evidence_not_shor
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
         mutate_resolver_after_decision=revoke,
     )
     assert first["execution"]["attempt_status"] == "denied"
@@ -273,6 +286,8 @@ def test_checkpoint_after_destination_commit_recovers_original_effect_without_re
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
         fault_after_dispatch=True,
     )
     original_effect = interrupted["execution"]["effect_id"]
@@ -302,6 +317,8 @@ def test_checkpoint_recovery_with_changed_policy_does_not_issue_replacement_refu
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
         fault_after_dispatch=True,
     )
     original_effect = interrupted["execution"]["effect_id"]
@@ -330,6 +347,8 @@ def test_replay_odes_failure_after_commit_retries_evidence_without_repeating_eff
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
+        execution_policy_factory=synthetic_refund_policy,
+        execution_policy_factory=synthetic_refund_policy,
         fault_evidence_once=True,
     )
     original_effect = interrupted["execution"]["effect_id"]
