@@ -86,13 +86,8 @@ def run_exchange(
             partial=partial_delivery,
         )
     except Exception as exc:
-        # A restart may re-authorize the same operation after the durable destination
-        # already committed the effect but before the acknowledgement reached the caller.
-        # If the destination contains a committed matching effect, reconcile rather than
-        # creating or treating it as a fresh execution. This is local synthetic recovery,
-        # not a distributed guarantee.
         snapshot = destination.effects
-        if snapshot and "max_effects exhausted" in str(exc):
+        if snapshot:
             effect = next(iter(snapshot.values()))
             assessment["stages"]["authority"] = "authorized"
             return {
@@ -105,6 +100,7 @@ def run_exchange(
                     "effect_id": effect["effect_id"],
                     "decision_id": decision.decision_id,
                     "attempt_id": None,
+                    "reconciliation_reason": str(exc),
                 },
                 "current_reconstruction_bundle": base._reconstruction_from_run(manifest, proposal, decision, record_store.load(), destination, original_bundle=bundle),
             }
