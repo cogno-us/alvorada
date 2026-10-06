@@ -23,6 +23,7 @@ digest = base.digest
 make_message = base.make_message
 parse_time = base.parse_time
 runtime_proposal_model = base.runtime_proposal_model
+_build_resolver = base._build_resolver
 
 CP_REVISION = "283500652d47a692fb0b99a1172a6d5faffbd9a7"
 MOLTBOT_REVISION = "6b0ba1185bcd390f71df947dda349415e4105f5f"
@@ -152,26 +153,128 @@ def _manifest() -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _build_success_context(tmp_path: Path):
-    h = load_actual_pinned_moltbot_helpers()
-    return h, *h._integrated(tmp_path)
+def _artifact_facts(odes_reference: dict[str, Any]) -> dict[str, Any]:
+    facts = dict(odes_reference["odes_package"].get("provenance", {}).get("execution_facts", {}))
+    effects = facts.get("destination_effects") or []
+    effect_ids = [item.get("effect_id") for item in effects if isinstance(item, dict) and item.get("effect_id")]
+    destination = facts.get("destination_observed")
+    ack = facts.get("acknowledgement_summary")
+    facts["pending_effects"] = effect_ids if destination == "partial" else []
+    facts["unresolved_delivery"] = bool(destination == "partial" or ack == "unknown")
+    return facts
 
 
-def _pipeline(manifest: dict[str, Any], cp_record: dict[str, Any], proposal: dict[str, Any] | None, moltbot: dict[str, Any] | None, *, predecessor: dict[str, Any] | None = None) -> dict[str, Any]:
+def _pipeline(
+    manifest: dict[str, Any],
+    cp_record: dict[str, Any],
+    proposal: dict[str, Any] | None,
+    moltbot: dict[str, Any] | None,
+    *,
+    predecessor: dict[str, Any] | None = None,
+    predecessor_packet_id: str | None = None,
+    state_version: int = 1,
+) -> dict[str, Any]:
     reconstructed = import_replay_bundle(cp_record, proposal, moltbot)
     bundle = reconstruction_dict(reconstructed)
     odes = export_odes_reference(manifest, bundle)
-    facts = dict(odes["odes_package"].get("provenance", {}).get("execution_facts", {}))
+    facts = _artifact_facts(odes)
     successor = None
     if predecessor is not None:
-        successor = make_successor_packet(predecessor, facts=facts, state_version=1, current_bundle=bundle)
+        successor = make_successor_packet(
+            predecessor,
+            facts=facts,
+            state_version=state_version,
+            current_bundle=bundle,
+            predecessor_packet_id=predecessor_packet_id,
+        )
     return {"reconstruction": reconstructed, "reconstruction_bundle": bundle, "odes_reference": odes, "successor_packet": successor, "execution_facts": facts}
+
+
+def _build_request_from_decision(h: Any, proposal: Any, resolver: Any, decision: Any) -> Any:
+    context = resolver.authority_context(proposal.authority_context_ref or "")
+    institution = context.get("institution") if isinstance(context, dict) else {}
+    binding = decision.binding
+    if binding is None:
+        raise ValueError("authorized execution requires a decision authorization binding")
+    operation = h.ExecutionOperation(
+        actor=proposal.actor,
+        principal=proposal.principal,
+        institution_id=institution["institution_id"],
+        authority_domain=institution["authority_domain"],
+        manifest_id=proposal.manifest_id,
+        manifest_version=proposal.manifest_version,
+        manifest_digest=proposal.manifest_digest,
+        proposal_commitment=h.commitment(proposal.model_dump(mode="json", exclude_none=False)),
+        action_id=proposal.action_id,
+        adapter_id=proposal.adapter_id,
+        target=proposal.target,
+        payload=json.loads(json.dumps(proposal.payload)),
+        payload_commitment=proposal.payload_commitment,
+        requested_permissions=tuple(proposal.requested_permissions),
+        amount=proposal.amount,
+        unit=proposal.unit,
+        effects=proposal.effects,
+        authority_context_id=proposal.authority_context_ref,
+        requirement_id=proposal.requirement_id,
+        grant_id=binding.grant_id,
+        grant_revision=binding.grant_revision,
+        effective_max_effects=binding.effective_max_effects,
+    )
+    return h.ExecutionEnvelope(h.EXECUTION_ENVELOPE_VERSION, decision.decision_id, decision.effect_id, operation)
+
+
+def _run_current_request(
+    *,
+    message: dict[str, Any],
+    bundle: dict[str, Any],
+    manifest: dict[str, Any],
+    destination: Any,
+    store_path: Path,
+    resolver: Any,
+    evaluation_time: str,
+    mutate_resolver_after_decision=None,
+    lose_ack: bool = False,
+    partial_delivery: bool = False,
+) -> dict[str, Any]:
+    h = load_actual_pinned_moltbot_helpers()
+    helper = h._load_pinned_helpers()
+    now = parse_time(evaluation_time)
+    proposal = runtime_proposal_model(bundle)
+    record_store = helper.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}.json", proposal.run_id or "run-gax-imx")
+    cp_destination = helper.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}.json")
+    workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
+    decision = workflow.decide(proposal, now=now)
+
+    if decision.result != "authorized":
+        pipe = _pipeline(manifest, record_store.load().model_dump(mode="json"), proposal.model_dump(mode="json", exclude_none=False), None, predecessor=message)
+        return {"status": decision.result, "decision": decision, "result": None, "destination_effects": {}, **pipe}
+
+    if mutate_resolver_after_decision:
+        mutate_resolver_after_decision(resolver)
+
+    request = _build_request_from_decision(h, proposal, resolver, decision)
+    executor = h.PinnedControlPlaneExecutor(workflow=workflow, destination=destination, policy=h.policy(request.operation))
+    simulate = "partial" if partial_delivery else ("lost_ack" if lose_ack else None)
+    result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=now, simulate=simulate)
+    cp_record, p, moltbot = _export_sources(workflow, proposal, request, result, destination)
+    pipe = _pipeline(manifest, cp_record, p, moltbot, predecessor=message)
+    return {
+        "status": result.status,
+        "result": result,
+        "decision": decision,
+        "request": request,
+        "destination": destination,
+        "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)},
+        **pipe,
+    }
 
 
 def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
     h = load_actual_pinned_moltbot_helpers()
     helper = h._load_pinned_helpers()
     manifest = helper.manifest()
+    bundle = json.loads(Path(os.environ["UPSTREAM_REPLAY_SUCCESS_EXAMPLE"]).read_text(encoding="utf-8")) if os.environ.get("UPSTREAM_REPLAY_SUCCESS_EXAMPLE") else {}
+    message = make_message(bundle) if bundle else {"message_id": "fixture-message", "conversation_id": "fixture-conversation"}
     if outcome == "hold":
         proposal = helper.proposal()
         resolver = helper.resolver_for(proposal)
@@ -181,10 +284,10 @@ def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
         records = helper.BoundedRecordStore(tmp_path / "cp-run.json", "run-1")
         workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=destination, records=records)
         decision = workflow.decide(proposal, now=helper.NOW)
-        pipe = _pipeline(manifest, workflow.records.load().model_dump(mode="json"), proposal.model_dump(mode="json", exclude_none=False), None)
+        pipe = _pipeline(manifest, workflow.records.load().model_dump(mode="json"), proposal.model_dump(mode="json", exclude_none=False), None, predecessor=message)
         return {"status": decision.result, "decision": decision, "destination_effects": {}, **pipe}
 
-    h, helper, proposal, resolver, workflow, decision, destination, executor, request = _build_success_context(tmp_path)
+    helper, proposal, resolver, workflow, decision, destination, executor, request = h._integrated(tmp_path)
     if outcome == "success":
         result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
     elif outcome == "denied_after_decision":
@@ -207,36 +310,56 @@ def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
         raise ValueError(f"unsupported outcome: {outcome}")
 
     cp, p, m = _export_sources(workflow, proposal, request, result, destination)
-    pipe = _pipeline(manifest, cp, p, m)
+    pipe = _pipeline(manifest, cp, p, m, predecessor=message)
     return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, **pipe}
 
 
 def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False) -> dict[str, Any]:
+    store_path = Path(store_path)
     store = TransactionalExchangeStore(store_path)
     _, err = store.record_message(message)
     if err:
-        return {"assessment": {"permitted_handling": "REFUSE", "errors": [err], "stages": {"identity_binding": "failed"}}, "execution": {"attempted": False, "reason": err}}
+        return {"assessment": {"permitted_handling": "REFUSE", "errors": [err], "stages": {"identity_binding": "failed"}}, "execution": {"attempted": False, "reason": err}, "successor_packet": None}
     assessment = assess_message(message, bundle, registry, evaluation_time=evaluation_time, seen_messages=store.seen_messages())
     if assessment["permitted_handling"] != "ACCEPT_FOR_ASSESSMENT":
-        return {"assessment": assessment, "execution": {"attempted": False, "reason": "message_not_execution_eligible"}}
-    outcome = "partial" if partial_delivery else ("lost_ack" if lose_ack else "success")
-    artifacts = run_actual_outcome(Path(store_path).parent, outcome)
+        return {"assessment": assessment, "execution": {"attempted": False, "reason": "message_not_execution_eligible"}, "successor_packet": None}
+    if resolver is None:
+        assessment["errors"].append("GAX-AUTHORITY-TRUSTED-RESOLVER-REQUIRED")
+        return {"assessment": assessment, "execution": {"attempted": False, "reason": "trusted_resolver_required"}, "successor_packet": None}
+    if destination is None:
+        assessment["errors"].append("GAX-EXECUTION-DESTINATION-REQUIRED")
+        return {"assessment": assessment, "execution": {"attempted": False, "reason": "destination_required"}, "successor_packet": None}
+
+    artifacts = _run_current_request(
+        message=message,
+        bundle=bundle,
+        manifest=manifest,
+        destination=destination,
+        store_path=store_path,
+        resolver=resolver,
+        evaluation_time=evaluation_time,
+        mutate_resolver_after_decision=mutate_resolver_after_decision,
+        lose_ack=lose_ack,
+        partial_delivery=partial_delivery,
+    )
     result = artifacts.get("result")
-    assessment["stages"]["authority"] = "authorized" if artifacts["status"] in {"executed", "unknown", "partial", "reconciled"} else artifacts["status"]
+    status = artifacts["status"]
+    assessment["stages"]["authority"] = "authorized" if status in {"executed", "unknown", "partial", "reconciled", "observed"} else status
     return {
         "assessment": assessment,
         "execution": {
-            "attempted": bool(getattr(result, "attempted", artifacts["status"] == "executed")),
-            "attempt_status": artifacts["status"],
+            "attempted": bool(getattr(result, "attempted", status == "executed")),
+            "attempt_status": status,
             "newly_executed": bool(getattr(result, "newly_executed", False)),
             "destination_observed": getattr(result, "observed_state", artifacts["execution_facts"].get("destination_observed")),
-            "effect_id": getattr(result, "effect_id", artifacts["decision"].effect_id),
-            "decision_id": getattr(result, "decision_id", artifacts["decision"].decision_id),
+            "effect_id": getattr(result, "effect_id", getattr(artifacts["decision"], "effect_id", None)),
+            "decision_id": getattr(result, "decision_id", getattr(artifacts["decision"], "decision_id", None)),
             "attempt_id": getattr(result, "attempt_id", None),
         },
         "current_reconstruction_bundle": artifacts["reconstruction_bundle"],
         "odes_reference": artifacts["odes_reference"],
         "successor_packet": artifacts["successor_packet"],
+        "execution_facts": artifacts["execution_facts"],
     }
 
 
@@ -276,16 +399,23 @@ class TransactionalExchangeStore:
             conn.execute("COMMIT")
             return False, None
 
+    @staticmethod
+    def _material_digest(packet: dict[str, Any]) -> str:
+        return digest({k: v for k, v in packet.items() if k != "packet_digest"})
+
     def accept_successor(self, packet: dict[str, Any], predecessor: dict[str, Any]) -> dict[str, Any]:
-        if packet.get("packet_digest") != digest({k: v for k, v in packet.items() if k != "packet_digest"}):
+        if packet.get("packet_digest") != self._material_digest(packet):
             return {"loaded": False, "effect_created": False, "status": "packet_digest_mismatch"}
+        if predecessor.get("packet_digest") and predecessor.get("packet_digest") != self._material_digest(predecessor):
+            return {"loaded": False, "effect_created": False, "status": "predecessor_digest_mismatch"}
+        predecessor_digest = predecessor.get("packet_digest") or self._material_digest(predecessor)
         if packet.get("profile") != PROFILE or packet.get("schema_version") != PROTOCOL_VERSION:
             return {"loaded": False, "effect_created": False, "status": "unsupported_profile_or_schema"}
         if packet.get("conversation_id") != predecessor.get("conversation_id"):
             return {"loaded": False, "effect_created": False, "status": "conversation_mismatch"}
         if packet.get("source_packet_id") not in {predecessor.get("message_id"), predecessor.get("packet_id")}:
             return {"loaded": False, "effect_created": False, "status": "source_identity_mismatch"}
-        if packet.get("source_commitment") != digest(predecessor):
+        if packet.get("source_commitment") != predecessor_digest:
             return {"loaded": False, "effect_created": False, "status": "source_commitment_mismatch"}
         try:
             version = int(str(packet.get("state_version", "")).split("-")[-1])
@@ -306,8 +436,7 @@ class TransactionalExchangeStore:
                 if packet.get("source_packet_id") != head["packet_id"]:
                     conn.execute("ROLLBACK")
                     return {"loaded": False, "effect_created": False, "status": "source_not_accepted_head"}
-                predecessor_head_digest = predecessor.get("packet_digest") or digest(predecessor)
-                if predecessor_head_digest != head["packet_digest"]:
+                if predecessor_digest != head["packet_digest"]:
                     conn.execute("ROLLBACK")
                     return {"loaded": False, "effect_created": False, "status": "predecessor_content_not_accepted_head"}
                 if version <= int(head["state_version"]):
@@ -333,13 +462,14 @@ DurableExchangeStore = TransactionalExchangeStore
 
 def make_successor_packet(predecessor: dict[str, Any], *, facts: dict[str, Any], state_version: int = 1, current_bundle: dict[str, Any] | None = None, predecessor_packet_id: str | None = None) -> dict[str, Any]:
     source_id = predecessor.get("packet_id") or predecessor.get("message_id")
+    source_commitment = digest({k: v for k, v in predecessor.items() if k != "packet_digest"})
     packet = {
         "packet_id": f"succ-{source_id}-{state_version}",
         "profile": PROFILE,
         "schema_version": PROTOCOL_VERSION,
         "conversation_id": predecessor.get("conversation_id"),
         "source_packet_id": source_id,
-        "source_commitment": digest(predecessor),
+        "source_commitment": source_commitment,
         "predecessor_packet_id": predecessor_packet_id,
         "state_version": f"state-{state_version}",
         "relevant_decisions": [facts.get("decision_id")],
@@ -361,7 +491,11 @@ def run_demo(manifest_path: str, replay_path: str, out_path: str) -> dict[str, A
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     bundle = json.loads(Path(replay_path).read_text(encoding="utf-8"))
     tmp = Path(out_path).parent
-    result = run_exchange(make_message(bundle), bundle, LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"), None, evaluation_time=EVAL, manifest=manifest, store_path=tmp / "demo_exchange.sqlite")
+    proposal = runtime_proposal_model(bundle)
+    resolver = _build_resolver(proposal, now=parse_time(EVAL))
+    h = load_actual_pinned_moltbot_helpers()
+    destination = h.DurableRefundDestination(tmp / "demo-moltbot-state")
+    result = run_exchange(make_message(bundle), bundle, LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"), destination, evaluation_time=EVAL, manifest=manifest, store_path=tmp / "demo_exchange.sqlite", resolver=resolver)
     Path(out_path).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     return result
 
