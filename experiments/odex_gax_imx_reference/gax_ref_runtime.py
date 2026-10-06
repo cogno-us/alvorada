@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import importlib
-import importlib.util
 import json
 import os
 import sqlite3
@@ -23,56 +22,65 @@ digest = base.digest
 make_message = base.make_message
 parse_time = base.parse_time
 runtime_proposal_model = base.runtime_proposal_model
-_build_resolver = base._build_resolver
 
 CP_REVISION = "283500652d47a692fb0b99a1172a6d5faffbd9a7"
-MOLTBOT_REVISION = "6b0ba1185bcd390f71df947dda349415e4105f5f"
+MOLTBOT_REVISION = "1d308faf664c504b6e310db3c7a310153ef7b067"  # accepted dependency
 MANIFEST_REVISION = "46c950bed37fe3812000895430bc0312d29e37ce"
-REPLAY_REVISION = "f12648313cedc2cf06145d397fa56cdea18cc800"
-ODES_REVISION = "b3a2f1e72df88cd24d93d1b7d69963f43139e749"
+REPLAY_REVISION = "f63ce914504dd06813c4ccd199b0570dbd8dd427"
+ODES_REVISION = "cba83a1c06f718a8afd76178f36e5cc15896347d"
+EVIDENCE_PACK_REVISION = "f1a76187b72d5b7c9fded12580ba081cb9cba338"
 ALVORADA_REVISION = "fb3d97938969a89e149e8ff8db2756091d1233fc"
+MOLTBOT_PRODUCER_PROFILE_ID = "urn:cognous:profiles:moltbot-safe-executor-producer"
+MOLTBOT_PRODUCER_PROFILE_VERSION = "1.0.0"
+GAX_ARTIFACT_EXPORT_PROFILE = "urn:cognous:profiles:gax-retained-artifacts"
+GAX_ARTIFACT_EXPORT_VERSION = "1.0.0"
 
 
 def _repo_path(env_name: str, default: str) -> Path:
     return Path(os.environ.get(env_name, default)).resolve()
 
 
-def load_actual_pinned_moltbot_helpers():
+def load_executor_runtime() -> dict[str, Any]:
     cp_root = _repo_path("MOLTBOT_SAFE_CONTROL_PLANE_ROOT", "upstream/control-plane")
     molt_root = _repo_path("MOLTBOT_SAFE_ROOT", "upstream/moltbot-safe")
-    manifest_path = _repo_path(
-        "MOLTBOT_SAFE_MANIFEST_FIXTURE",
-        os.environ.get("UPSTREAM_MANIFEST_EXAMPLE", "upstream/manifest/examples/refund_integration_v1_1.manifest.json"),
-    )
-    missing = [str(p) for p in (cp_root, molt_root, manifest_path) if not p.exists()]
+    missing = [str(p) for p in (cp_root, molt_root) if not p.exists()]
     if missing:
         raise RuntimeError("pinned upstream checkout is unavailable: " + ", ".join(missing))
     for path in (str(cp_root / "src"), str(molt_root)):
         if path not in sys.path:
             sys.path.insert(0, path)
-    os.environ["MOLTBOT_SAFE_CONTROL_PLANE_ROOT"] = str(cp_root)
-    os.environ["MOLTBOT_SAFE_MANIFEST_FIXTURE"] = str(manifest_path)
-    helper_path = molt_root / "tests" / "test_safe_executor.py"
-    spec = importlib.util.spec_from_file_location("alvorada_actual_pinned_moltbot_helpers", helper_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("unable to load pinned Moltbot helper module")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+
+    producer = importlib.import_module("engine.producer_contract")
+    cp = importlib.import_module("agent_control_plane.bounded")
+    if producer.EXECUTOR_PRODUCER_PROFILE_ID != MOLTBOT_PRODUCER_PROFILE_ID:
+        raise RuntimeError("unsupported Moltbot executor producer profile id")
+    if producer.EXECUTOR_PRODUCER_PROFILE_VERSION != MOLTBOT_PRODUCER_PROFILE_VERSION:
+        raise RuntimeError("unsupported Moltbot executor producer profile version")
+    return {
+        "producer": producer,
+        "cp": cp,
+        "PinnedControlPlaneExecutor": producer.PinnedControlPlaneExecutor,
+        "DurableRefundDestination": producer.DurableRefundDestination,
+        "ExecutionEnvelope": producer.ExecutionEnvelope,
+        "ExecutionOperation": producer.ExecutionOperation,
+        "LocalExecutionPolicy": producer.LocalExecutionPolicy,
+        "commitment": producer.commitment,
+        "export_execution_artifacts": producer.export_execution_artifacts,
+    }
 
 
 def actual_executor_classes() -> dict[str, Any]:
-    h = load_actual_pinned_moltbot_helpers()
-    adapter_mod = importlib.import_module("engine.control_plane_adapter")
+    runtime = load_executor_runtime()
     return {
-        "PinnedControlPlaneExecutor": h.PinnedControlPlaneExecutor,
-        "ControlPlaneRefundDestinationAdapter": adapter_mod.ControlPlaneRefundDestinationAdapter,
-        "DurableRefundDestination": h.DurableRefundDestination,
-        "ExecutionEnvelope": h.ExecutionEnvelope,
-        "ExecutionOperation": h.ExecutionOperation,
-        "LocalExecutionPolicy": h.LocalExecutionPolicy,
+        key: runtime[key]
+        for key in (
+            "PinnedControlPlaneExecutor",
+            "DurableRefundDestination",
+            "ExecutionEnvelope",
+            "ExecutionOperation",
+            "LocalExecutionPolicy",
+        )
     }
-
 
 def _sqlite_rows(path: Path, table: str) -> list[dict[str, Any]]:
     with sqlite3.connect(path) as conn:
@@ -109,34 +117,30 @@ def _manifest() -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _export_sources(workflow: Any, proposal: Any, request: Any, result: Any, destination: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _export_sources(
+    workflow: Any,
+    proposal: Any,
+    request: Any,
+    result: Any,
+    destination: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    runtime = load_executor_runtime()
     cp_record = workflow.records.load().model_dump(mode="json")
-    all_effects = _sqlite_rows(Path(destination.path), "effects")
-    all_attempts = _sqlite_rows(Path(destination.path), "attempts")
-    all_events = _sqlite_rows(Path(destination.path), "attempt_events")
-    current_effect = request.effect_id
-    current_decision = request.decision_id
-    current_attempt_ids: set[str] = set()
-    if getattr(result, "attempt_id", None):
-        current_attempt_ids.add(str(result.attempt_id))
-    selected_attempts: list[dict[str, Any]] = []
-    for row in all_attempts:
-        if row.get("effect_id") != current_effect:
-            continue
-        if row.get("decision_id") == current_decision or row.get("attempt_id") in current_attempt_ids:
-            selected_attempts.append(row)
-            if row.get("attempt_id"):
-                current_attempt_ids.add(str(row["attempt_id"]))
-    selected_events = [row for row in all_events if row.get("attempt_id") in current_attempt_ids]
-    moltbot = {
-        "execution_envelope": dataclasses.asdict(request),
-        "execution_result": dataclasses.asdict(result),
-        "effects": [row for row in all_effects if row.get("effect_id") == current_effect],
-        "attempts": selected_attempts,
-        "attempt_events": selected_events,
-    }
-    return cp_record, proposal.model_dump(mode="json", exclude_none=False), moltbot
-
+    producer_export = runtime["export_execution_artifacts"](
+        request,
+        result,
+        destination,
+        repository_revision=MOLTBOT_REVISION,
+        source_asserted_provenance={
+            "producer": "cogno-us/moltbot-safe",
+            "consumer": "cogno-us/alvorada:gax_ref_runtime",
+        },
+    )
+    return (
+        cp_record,
+        proposal.model_dump(mode="json", exclude_none=False),
+        producer_export,
+    )
 
 def import_replay_bundle(cp_record: dict[str, Any], proposal: dict[str, Any] | None, moltbot: dict[str, Any] | None = None) -> Any:
     from agent_replay_bundle.importers import import_bounded_workflow
@@ -193,20 +197,27 @@ def _pipeline(manifest: dict[str, Any], cp_record: dict[str, Any], proposal: dic
     successor = None
     if predecessor is not None:
         successor = make_successor_packet(predecessor, facts=facts, state_version=state_version, current_bundle=bundle, predecessor_packet_id=predecessor_packet_id)
-    return {"reconstruction": reconstructed, "reconstruction_bundle": bundle, "odes_reference": odes, "successor_packet": successor, "execution_facts": facts}
+    return {
+        "reconstruction": reconstructed,
+        "reconstruction_bundle": bundle,
+        "odes_reference": odes,
+        "successor_packet": successor,
+        "execution_facts": facts,
+        "producer_identity_refs": _producer_identity_refs(moltbot),
+    }
 
 
 def execution_facts(bundle: dict[str, Any]) -> dict[str, Any]:
     return dict(export_odes_reference(_manifest(), bundle)["odes_package"].get("provenance", {}).get("execution_facts", {}))
 
 
-def _build_request_from_decision(h: Any, proposal: Any, resolver: Any, decision: Any) -> Any:
+def _build_request_from_decision(runtime: dict[str, Any], proposal: Any, resolver: Any, decision: Any) -> Any:
     context = resolver.authority_context(proposal.authority_context_ref or "")
     institution = context.get("institution") if isinstance(context, dict) else {}
     binding = decision.binding
     if binding is None:
         raise ValueError("authorized execution requires a decision authorization binding")
-    operation = h.ExecutionOperation(
+    operation = runtime["ExecutionOperation"](
         actor=proposal.actor,
         principal=proposal.principal,
         institution_id=institution["institution_id"],
@@ -214,7 +225,7 @@ def _build_request_from_decision(h: Any, proposal: Any, resolver: Any, decision:
         manifest_id=proposal.manifest_id,
         manifest_version=proposal.manifest_version,
         manifest_digest=proposal.manifest_digest,
-        proposal_commitment=h.commitment(proposal.model_dump(mode="json", exclude_none=False)),
+        proposal_commitment=runtime["commitment"](proposal.model_dump(mode="json", exclude_none=False)),
         action_id=proposal.action_id,
         adapter_id=proposal.adapter_id,
         target=proposal.target,
@@ -230,7 +241,8 @@ def _build_request_from_decision(h: Any, proposal: Any, resolver: Any, decision:
         grant_revision=binding.grant_revision,
         effective_max_effects=binding.effective_max_effects,
     )
-    return h.ExecutionEnvelope(h.EXECUTION_ENVELOPE_VERSION, decision.decision_id, decision.effect_id, operation)
+    producer = runtime["producer"]
+    return runtime["ExecutionEnvelope"](producer.EXECUTION_ENVELOPE_VERSION, decision.decision_id, decision.effect_id, operation)
 
 
 class Obj:
@@ -254,8 +266,8 @@ def _validate_bound_association(association: dict[str, Any]) -> str | None:
         return "stored_envelope_identity_mismatch"
     if result.get("decision_id") != decision_id or result.get("effect_id") != effect_id:
         return "stored_result_identity_mismatch"
-    h = load_actual_pinned_moltbot_helpers()
-    if operation.get("proposal_commitment") != h.commitment(proposal):
+    runtime = load_executor_runtime()
+    if operation.get("proposal_commitment") != runtime["commitment"](proposal):
         return "stored_operation_proposal_commitment_mismatch"
     for row in moltbot.get("effects") or []:
         if row.get("effect_id") != effect_id:
@@ -264,6 +276,140 @@ def _validate_bound_association(association: dict[str, Any]) -> str | None:
         if row.get("effect_id") != effect_id or row.get("decision_id") != decision_id:
             return "stored_attempt_identity_mismatch"
     return None
+
+
+def _producer_identity_refs(moltbot: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(moltbot, dict):
+        return {}
+    envelope = moltbot.get("execution_envelope") or {}
+    result = moltbot.get("execution_result") or {}
+    attempt_identity = moltbot.get("attempt_identity")
+    executor_attempt_ids = [
+        row.get("attempt_id")
+        for row in (moltbot.get("attempts") or [])
+        if isinstance(row, dict) and row.get("attempt_id")
+    ]
+    control_plane_attempt_ids = [
+        row.get("attempt_id")
+        for row in (moltbot.get("control_plane_attempts") or [])
+        if isinstance(row, dict) and row.get("attempt_id")
+    ]
+    refs = {
+        "decision_id": result.get("decision_id") or envelope.get("decision_id"),
+        "effect_id": result.get("effect_id") or envelope.get("effect_id"),
+        "attempt_identity": json.loads(_json_dumps(attempt_identity)) if isinstance(attempt_identity, dict) else None,
+        "executor_attempt_ids": executor_attempt_ids,
+        "control_plane_attempt_ids": control_plane_attempt_ids,
+        "executor_producer_profile": json.loads(_json_dumps(moltbot.get("producer_profile"))) if isinstance(moltbot.get("producer_profile"), dict) else None,
+        "executor_repository": json.loads(_json_dumps(moltbot.get("repository"))) if isinstance(moltbot.get("repository"), dict) else None,
+    }
+    return {k: v for k, v in refs.items() if v not in (None, [], {})}
+
+
+def _retained_artifact_export(
+    artifacts: dict[str, Any],
+    *,
+    state: str,
+    lineage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reconstruction = copy_value = json.loads(_json_dumps(artifacts["reconstruction_bundle"]))
+    odes_ref = artifacts["odes_reference"]
+    odes_retained = {
+        "odes_package": json.loads(_json_dumps(odes_ref.get("odes_package"))),
+        "recipient_validation": json.loads(_json_dumps(odes_ref.get("recipient_validation"))),
+        "exchange_metadata": json.loads(_json_dumps(odes_ref.get("exchange_metadata") or {})),
+    }
+    successor = json.loads(_json_dumps(artifacts.get("successor_packet"))) if artifacts.get("successor_packet") is not None else None
+    refs = {
+        **json.loads(_json_dumps(artifacts.get("producer_identity_refs") or {})),
+        "reconstruction_bundle_id": reconstruction.get("bundle_id"),
+        "reconstruction_digest": digest(reconstruction),
+        "odes_package_digest": digest(odes_retained["odes_package"]) if odes_retained["odes_package"] is not None else None,
+        "odes_validation_digest": digest(odes_retained["recipient_validation"]) if odes_retained["recipient_validation"] is not None else None,
+        "successor_packet_id": successor.get("packet_id") if isinstance(successor, dict) else None,
+        "successor_packet_digest": (
+            successor.get("packet_digest") if isinstance(successor, dict) else None
+        ),
+    }
+    commitments = {
+        "reconstruction_bundle": refs.get("reconstruction_digest"),
+        "odes_package": refs.get("odes_package_digest"),
+        "recipient_validation": refs.get("odes_validation_digest"),
+        "successor_packet": refs.get("successor_packet_digest"),
+    }
+    return {
+        "export_profile": GAX_ARTIFACT_EXPORT_PROFILE,
+        "export_version": GAX_ARTIFACT_EXPORT_VERSION,
+        "state": state,
+        "reconstruction_bundle": reconstruction,
+        "odes": odes_retained,
+        "successor_packet": successor,
+        "producer_refs": refs,
+        "content_commitments": {k: v for k, v in commitments.items() if v is not None},
+        "lineage": json.loads(_json_dumps(lineage or {"relationship": "original"})),
+    }
+
+
+def _validate_retained_artifact_export(value: dict[str, Any]) -> str | None:
+    if value.get("export_profile") != GAX_ARTIFACT_EXPORT_PROFILE:
+        return "unsupported_artifact_export_profile"
+    if value.get("export_version") != GAX_ARTIFACT_EXPORT_VERSION:
+        return "unsupported_artifact_export_version"
+    reconstruction = value.get("reconstruction_bundle")
+    odes = value.get("odes") or {}
+    successor = value.get("successor_packet")
+    refs = value.get("producer_refs") or {}
+    commitments = value.get("content_commitments") or {}
+    if not isinstance(reconstruction, dict):
+        return "retained_reconstruction_missing"
+    if refs.get("reconstruction_bundle_id") != reconstruction.get("bundle_id"):
+        return "retained_reconstruction_identity_mismatch"
+    if refs.get("reconstruction_digest") != digest(reconstruction):
+        return "retained_reconstruction_digest_mismatch"
+    if commitments.get("reconstruction_bundle") != refs.get("reconstruction_digest"):
+        return "retained_reconstruction_commitment_mismatch"
+    package = odes.get("odes_package")
+    validation = odes.get("recipient_validation")
+    if package is not None and refs.get("odes_package_digest") != digest(package):
+        return "retained_odes_package_digest_mismatch"
+    if package is not None and commitments.get("odes_package") != refs.get("odes_package_digest"):
+        return "retained_odes_package_commitment_mismatch"
+    if validation is not None and refs.get("odes_validation_digest") != digest(validation):
+        return "retained_odes_validation_digest_mismatch"
+    if validation is not None and commitments.get("recipient_validation") != refs.get("odes_validation_digest"):
+        return "retained_odes_validation_commitment_mismatch"
+    if successor is not None:
+        if refs.get("successor_packet_id") != successor.get("packet_id"):
+            return "retained_successor_identity_mismatch"
+        if refs.get("successor_packet_digest") != successor.get("packet_digest"):
+            return "retained_successor_digest_mismatch"
+        if successor.get("packet_digest") != digest({k: v for k, v in successor.items() if k != "packet_digest"}):
+            return "retained_successor_content_digest_mismatch"
+        if commitments.get("successor_packet") != refs.get("successor_packet_digest"):
+            return "retained_successor_commitment_mismatch"
+    return None
+
+
+def _artifacts_from_retained_export(value: dict[str, Any]) -> dict[str, Any]:
+    problem = _validate_retained_artifact_export(value)
+    if problem:
+        raise ValueError(problem)
+    odes = value["odes"]
+    facts = _artifact_facts({
+        "odes_package": odes["odes_package"],
+        "recipient_validation": odes.get("recipient_validation"),
+    })
+    return {
+        "reconstruction_bundle": value["reconstruction_bundle"],
+        "odes_reference": {
+            "odes_package": odes["odes_package"],
+            "recipient_validation": odes.get("recipient_validation"),
+            "exchange_metadata": odes.get("exchange_metadata") or {},
+        },
+        "successor_packet": value.get("successor_packet"),
+        "execution_facts": facts,
+        "artifact_export": value,
+    }
 
 
 def _execution_response(assessment: dict[str, Any], status: str, result: Any, decision: Any, artifacts: dict[str, Any], *, attempted_override: bool | None = None, newly_executed_override: bool | None = None) -> dict[str, Any]:
@@ -289,11 +435,15 @@ def _execution_response(assessment: dict[str, Any], status: str, result: Any, de
         "odes_reference": artifacts["odes_reference"],
         "successor_packet": artifacts["successor_packet"],
         "execution_facts": artifacts["execution_facts"],
+        "artifact_export": artifacts.get("artifact_export"),
     }
 
 
 def _artifacts_from_association(manifest: dict[str, Any], message: dict[str, Any], association: dict[str, Any]) -> dict[str, Any]:
-    return _pipeline(manifest, association["cp_record"], association["proposal"], association.get("moltbot"), predecessor=message)
+    retained = association.get("artifact_export")
+    if not isinstance(retained, dict):
+        raise LookupError("original_artifacts_unavailable")
+    return _artifacts_from_retained_export(retained)
 
 
 def _duplicate_redelivery_result(message: dict[str, Any], assessment: dict[str, Any], manifest: dict[str, Any], association: dict[str, Any]) -> dict[str, Any]:
@@ -301,7 +451,20 @@ def _duplicate_redelivery_result(message: dict[str, Any], assessment: dict[str, 
     if problem:
         assessment["errors"].append("GAX-EXECUTION-STORED-WORKFLOW-INTEGRITY-FAILED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": problem, "attempt_status": "unresolved_duplicate"}, "successor_packet": None}
-    artifacts = _artifacts_from_association(manifest, message, association)
+    try:
+        artifacts = _artifacts_from_association(manifest, message, association)
+    except (LookupError, ValueError) as exc:
+        assessment["errors"].append("GAX-ARTIFACTS-UNAVAILABLE-OR-INVALID")
+        return {
+            "assessment": assessment,
+            "execution": {
+                "attempted": False,
+                "reason": str(exc),
+                "attempt_status": "unresolved_duplicate",
+            },
+            "successor_packet": None,
+            "artifact_export": None,
+        }
     result_data = association.get("result") or {}
     status = association.get("status") or result_data.get("status") or "unresolved"
     if status == "executed":
@@ -317,14 +480,51 @@ def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], man
         assessment["errors"].append("GAX-EXECUTION-CHECKPOINT-INTEGRITY-FAILED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": problem, "attempt_status": "hold"}, "successor_packet": None}
     if checkpoint.get("moltbot") and checkpoint.get("result"):
-        artifacts = _artifacts_from_association(manifest, message, checkpoint)
-        store.record_workflow(message, {"proposal_record": checkpoint["proposal"], "decision": checkpoint["decision"], "request": checkpoint.get("request"), "result": checkpoint.get("result"), "status": checkpoint.get("status") or checkpoint["result"].get("status"), "cp_record": checkpoint["cp_record"], "moltbot_record": checkpoint.get("moltbot")})
-        status = checkpoint.get("status") or checkpoint["result"].get("status") or "reconciled"
-        if status == "executed":
+        pipe = _pipeline(
+            manifest,
+            checkpoint["cp_record"],
+            checkpoint["proposal"],
+            checkpoint.get("moltbot"),
+            predecessor=message,
+        )
+        source_commitment = digest({
+            "cp_record": checkpoint["cp_record"],
+            "proposal": checkpoint["proposal"],
+            "moltbot": checkpoint.get("moltbot"),
+        })
+        pipe["artifact_export"] = _retained_artifact_export(
+            pipe,
+            state="regenerated_derivative",
+            lineage={
+                "relationship": "regenerated_derivative",
+                "original_artifacts": "unavailable",
+                "source_checkpoint_commitment": source_commitment,
+                "effect_reexecution": False,
+            },
+        )
+        result_status = (checkpoint.get("result") or {}).get("status")
+        status = result_status or checkpoint.get("status") or "reconciled"
+        if status in {"executed", "dispatched", "bound"}:
             status = "reconciled"
+        store.record_workflow(
+            message,
+            {
+                "proposal_record": checkpoint["proposal"],
+                "decision": checkpoint["decision"],
+                "request": checkpoint.get("request"),
+                "result": checkpoint.get("result"),
+                "status": status,
+                "cp_record": checkpoint["cp_record"],
+                "moltbot_record": checkpoint.get("moltbot"),
+                **pipe,
+            },
+        )
         result = Obj({**checkpoint["result"], "status": status, "newly_executed": False})
         decision = Obj({"decision_id": checkpoint.get("decision_id"), "effect_id": checkpoint.get("effect_id")})
-        return _execution_response(assessment, status, result, decision, artifacts, attempted_override=False, newly_executed_override=False)
+        return _execution_response(
+            assessment, status, result, decision, pipe,
+            attempted_override=False, newly_executed_override=False,
+        )
     if destination is not None:
         rows = [r for r in _effect_rows(destination) if r.get("effect_id") == checkpoint.get("effect_id")]
         if rows:
@@ -334,30 +534,42 @@ def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], man
     return {"assessment": assessment, "execution": {"attempted": False, "reason": "checkpoint_without_dispatch_evidence", "attempt_status": "hold", "effect_id": checkpoint.get("effect_id"), "decision_id": checkpoint.get("decision_id")}, "successor_packet": None}
 
 
-def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], manifest: dict[str, Any], destination: Any, store_path: Path, resolver: Any, evaluation_time: str, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, store: "TransactionalExchangeStore" | None = None, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
-    h = load_actual_pinned_moltbot_helpers()
-    helper = h._load_pinned_helpers()
+def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], manifest: dict[str, Any], destination: Any, store_path: Path, resolver: Any, evaluation_time: str, execution_policy_factory: Any, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, store: "TransactionalExchangeStore" | None = None, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
+    runtime = load_executor_runtime()
+    cp = runtime["cp"]
     now = parse_time(evaluation_time)
     proposal = runtime_proposal_model(bundle)
     record_suffix = digest({"message_id": message["message_id"], "message_digest": message.get("message_digest"), "evaluation_time": evaluation_time})[-16:]
-    record_store = helper.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}-{record_suffix}.json", proposal.run_id or "run-gax-imx")
-    cp_destination = helper.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}-{record_suffix}.json")
-    workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
+    record_store = cp.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}-{record_suffix}.json", proposal.run_id or "run-gax-imx")
+    cp_destination = cp.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}-{record_suffix}.json")
+    workflow = cp.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
     decision = workflow.decide(proposal, now=now)
     proposal_record = proposal.model_dump(mode="json", exclude_none=False)
     cp_record = record_store.load().model_dump(mode="json")
 
     if decision.result != "authorized":
         pipe = _pipeline(manifest, cp_record, proposal_record, None, predecessor=message)
+        pipe["artifact_export"] = _retained_artifact_export(
+            pipe,
+            state="original_complete",
+            lineage={"relationship": "original", "effect_reexecution": False},
+        )
         return {"status": decision.result, "decision": decision, "result": None, "destination_effects": {}, "proposal_record": proposal_record, "cp_record": cp_record, "moltbot_record": None, **pipe}
 
     if mutate_resolver_after_decision:
         mutate_resolver_after_decision(resolver)
 
-    request = _build_request_from_decision(h, proposal, resolver, decision)
+    request = _build_request_from_decision(runtime, proposal, resolver, decision)
     if store is not None:
         store.record_dispatch_checkpoint(message, {"status": "bound", "proposal_record": proposal_record, "decision": _asdict(decision), "request": _asdict(request), "cp_record": cp_record})
-    executor = h.PinnedControlPlaneExecutor(workflow=workflow, destination=destination, policy=h.policy(request.operation))
+    policy = execution_policy_factory(request.operation)
+    if not isinstance(policy, runtime["LocalExecutionPolicy"]):
+        raise TypeError("execution_policy_factory must return LocalExecutionPolicy")
+    executor = runtime["PinnedControlPlaneExecutor"](
+        workflow=workflow,
+        destination=destination,
+        policy=policy,
+    )
     simulate = "partial" if partial_delivery else ("lost_ack" if lose_ack else None)
     result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=now, simulate=simulate)
     cp_record, p, moltbot = _export_sources(workflow, proposal, request, result, destination)
@@ -369,10 +581,15 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
     if fault_evidence_once and store is not None and not store.consume_fault_once(message["message_id"], "evidence_export"):
         return {"status": "evidence_export_failed", "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, "proposal_record": p, "cp_record": cp_record, "moltbot_record": moltbot, "fault": "replay_odes_export_failed_after_dispatch"}
     pipe = _pipeline(manifest, cp_record, p, moltbot, predecessor=message)
+    pipe["artifact_export"] = _retained_artifact_export(
+        pipe,
+        state="original_complete",
+        lineage={"relationship": "original", "effect_reexecution": False},
+    )
     return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, "proposal_record": p, "cp_record": cp_record, "moltbot_record": moltbot, **pipe}
 
 
-def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
+def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, execution_policy_factory: Any | None = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
     store_path = Path(store_path)
     store = TransactionalExchangeStore(store_path)
     duplicate, err = store.record_message(message)
@@ -401,7 +618,10 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
         assessment["errors"].append("GAX-EXECUTION-DESTINATION-REQUIRED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "destination_required"}, "successor_packet": None}
 
-    artifacts = _run_current_request(message=message, bundle=bundle, manifest=manifest, destination=destination, store_path=store_path, resolver=resolver, evaluation_time=evaluation_time, mutate_resolver_after_decision=mutate_resolver_after_decision, lose_ack=lose_ack, partial_delivery=partial_delivery, store=store, fault_after_dispatch=fault_after_dispatch, fault_evidence_once=fault_evidence_once)
+    if execution_policy_factory is None:
+        assessment["errors"].append("GAX-EXECUTION-POLICY-REQUIRED")
+        return {"assessment": assessment, "execution": {"attempted": False, "reason": "execution_policy_factory_required"}, "successor_packet": None}
+    artifacts = _run_current_request(message=message, bundle=bundle, manifest=manifest, destination=destination, store_path=store_path, resolver=resolver, evaluation_time=evaluation_time, execution_policy_factory=execution_policy_factory, mutate_resolver_after_decision=mutate_resolver_after_decision, lose_ack=lose_ack, partial_delivery=partial_delivery, store=store, fault_after_dispatch=fault_after_dispatch, fault_evidence_once=fault_evidence_once)
     result = artifacts.get("result")
     status = artifacts["status"]
     if artifacts.get("fault") == "after_dispatch_before_workflow_persistence":
@@ -422,6 +642,7 @@ class TransactionalExchangeStore:
                 CREATE TABLE IF NOT EXISTS messages(message_id TEXT PRIMARY KEY, message_digest TEXT NOT NULL, conversation_id TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS message_workflows(message_id TEXT PRIMARY KEY,message_digest TEXT NOT NULL,conversation_id TEXT NOT NULL,status TEXT NOT NULL,proposal_commitment TEXT,decision_id TEXT,effect_id TEXT,attempt_id TEXT,proposal_json TEXT NOT NULL,decision_json TEXT NOT NULL,request_json TEXT,result_json TEXT,cp_record_json TEXT NOT NULL,moltbot_json TEXT);
                 CREATE TABLE IF NOT EXISTS dispatch_checkpoints(message_id TEXT PRIMARY KEY,message_digest TEXT NOT NULL,conversation_id TEXT NOT NULL,state TEXT NOT NULL,proposal_commitment TEXT,decision_id TEXT,effect_id TEXT,attempt_id TEXT,proposal_json TEXT NOT NULL,decision_json TEXT NOT NULL,request_json TEXT,result_json TEXT,cp_record_json TEXT NOT NULL,moltbot_json TEXT,faults_json TEXT);
+                CREATE TABLE IF NOT EXISTS artifact_exports(message_id TEXT PRIMARY KEY,message_digest TEXT NOT NULL,conversation_id TEXT NOT NULL,export_profile TEXT NOT NULL,export_version TEXT NOT NULL,state TEXT NOT NULL,artifact_json TEXT NOT NULL,artifact_digest TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS lineage(packet_id TEXT PRIMARY KEY, packet_digest TEXT NOT NULL, conversation_id TEXT NOT NULL, parent_packet_id TEXT, state_version INTEGER NOT NULL, source_packet_id TEXT NOT NULL, source_commitment TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS heads(conversation_id TEXT PRIMARY KEY, packet_id TEXT NOT NULL, packet_digest TEXT NOT NULL, state_version INTEGER NOT NULL);
                 """
@@ -498,6 +719,24 @@ class TransactionalExchangeStore:
             conn.execute("COMMIT")
             return already
 
+    def artifact_export_for_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifact_exports WHERE message_id=?",
+                (message["message_id"],),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["message_digest"] != message["message_digest"] or row["conversation_id"] != message["conversation_id"]:
+            return None
+        value = _json_loads(row["artifact_json"])
+        if row["artifact_digest"] != digest(value):
+            raise ValueError("retained_artifact_row_digest_mismatch")
+        problem = _validate_retained_artifact_export(value)
+        if problem:
+            raise ValueError(problem)
+        return value
+
     def record_workflow(self, message: dict[str, Any], artifacts: dict[str, Any]) -> None:
         proposal = artifacts["proposal_record"]
         decision = _asdict(artifacts.get("decision"))
@@ -514,7 +753,24 @@ class TransactionalExchangeStore:
             if row is None or row["message_digest"] != message["message_digest"]:
                 conn.execute("ROLLBACK")
                 raise RuntimeError("message receipt must be recorded before workflow association")
+            artifact_export = artifacts.get("artifact_export")
+            if not isinstance(artifact_export, dict):
+                conn.execute("ROLLBACK")
+                raise RuntimeError("workflow completion requires a retained artifact export")
+            problem = _validate_retained_artifact_export(artifact_export)
+            if problem:
+                conn.execute("ROLLBACK")
+                raise RuntimeError(problem)
+            encoded_export = _json_dumps(artifact_export)
             conn.execute("""INSERT OR REPLACE INTO message_workflows(message_id,message_digest,conversation_id,status,proposal_commitment,decision_id,effect_id,attempt_id,proposal_json,decision_json,request_json,result_json,cp_record_json,moltbot_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (message["message_id"], message["message_digest"], message["conversation_id"], status, proposal_commitment, decision_id, effect_id, attempt_id, _json_dumps(proposal), _json_dumps(decision), _json_dumps(request) if request is not None else None, _json_dumps(result) if result is not None else None, _json_dumps(artifacts["cp_record"]), _json_dumps(artifacts.get("moltbot_record")) if artifacts.get("moltbot_record") is not None else None))
+            conn.execute(
+                """INSERT OR REPLACE INTO artifact_exports(message_id,message_digest,conversation_id,export_profile,export_version,state,artifact_json,artifact_digest) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    message["message_id"], message["message_digest"], message["conversation_id"],
+                    artifact_export["export_profile"], artifact_export["export_version"],
+                    artifact_export["state"], encoded_export, digest(artifact_export),
+                ),
+            )
             conn.execute("COMMIT")
 
     def workflow_for_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -522,7 +778,9 @@ class TransactionalExchangeStore:
             row = conn.execute("SELECT * FROM message_workflows WHERE message_id=?", (message["message_id"],)).fetchone()
         if row is None or row["message_digest"] != message["message_digest"] or row["conversation_id"] != message["conversation_id"]:
             return None
-        return self._association_payload(row)
+        out = self._association_payload(row)
+        out["artifact_export"] = self.artifact_export_for_message(message)
+        return out
 
     @staticmethod
     def _material_digest(packet: dict[str, Any]) -> str:
@@ -601,57 +859,83 @@ def load_successor_packet(packet: dict[str, Any], destination: Any, *, predecess
 
 
 def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
-    h = load_actual_pinned_moltbot_helpers()
-    helper = h._load_pinned_helpers()
-    manifest = helper.manifest()
-    bundle = json.loads(Path(os.environ["UPSTREAM_REPLAY_SUCCESS_EXAMPLE"]).read_text(encoding="utf-8")) if os.environ.get("UPSTREAM_REPLAY_SUCCESS_EXAMPLE") else {}
-    message = make_message(bundle) if bundle else {"message_id": "fixture-message", "conversation_id": "fixture-conversation"}
-    if outcome == "hold":
-        proposal = helper.proposal()
-        resolver = helper.resolver_for(proposal)
-        grant = resolver.contexts[helper.PROFILE]["grant"]
-        resolver.statuses[grant["grant_id"]].status = "revoked"
-        destination = helper.LocalRefundDestination(tmp_path / "cp-destination.json")
-        records = helper.BoundedRecordStore(tmp_path / "cp-run.json", "run-1")
-        workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=destination, records=records)
-        decision = workflow.decide(proposal, now=helper.NOW)
-        pipe = _pipeline(manifest, workflow.records.load().model_dump(mode="json"), proposal.model_dump(mode="json", exclude_none=False), None, predecessor=message)
-        return {"status": decision.result, "decision": decision, "destination_effects": {}, **pipe}
-    helper, proposal, resolver, workflow, decision, destination, executor, request = h._integrated(tmp_path)
-    if outcome == "success":
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "denied_after_decision":
-        grant = resolver.contexts[helper.PROFILE]["grant"]
-        resolver.statuses[grant["grant_id"]].status = "revoked"
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "lost_ack":
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="lost_ack")
-    elif outcome == "restart_reconciliation":
-        executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="lost_ack")
-        destination = h.DurableRefundDestination(destination.root)
-        executor = h.PinnedControlPlaneExecutor(workflow=workflow, destination=destination, policy=h.policy(request.operation))
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "duplicate_delivery":
-        executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "partial":
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="partial")
-    else:
-        raise ValueError(f"unsupported outcome: {outcome}")
-    cp, p, m = _export_sources(workflow, proposal, request, result, destination)
-    pipe = _pipeline(manifest, cp, p, m, predecessor=message)
-    return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, **pipe}
+    from .synthetic_fixture import build_synthetic_resolver, synthetic_refund_policy
 
+    manifest = _manifest()
+    bundle = json.loads(
+        Path(os.environ["UPSTREAM_REPLAY_SUCCESS_EXAMPLE"]).read_text(encoding="utf-8")
+    )
+    message = make_message(bundle, message_id=f"fixture-{outcome}")
+    proposal = runtime_proposal_model(bundle)
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    runtime = load_executor_runtime()
+    destination = runtime["DurableRefundDestination"](tmp_path / "moltbot-state")
+    store_path = tmp_path / "exchange.sqlite"
+
+    mutate = None
+    lose_ack = outcome == "lost_ack"
+    partial = outcome == "partial"
+    if outcome == "hold":
+        grant = resolver.contexts[base.PROFILE_AUTH_CONTEXT]["grant"]
+        resolver.statuses[grant["grant_id"]].status = "revoked"
+    elif outcome == "denied_after_decision":
+        def mutate(current):
+            grant = current.contexts[base.PROFILE_AUTH_CONTEXT]["grant"]
+            current.statuses[grant["grant_id"]].status = "revoked"
+    elif outcome not in {"success", "restart_reconciliation", "duplicate_delivery", "lost_ack", "partial"}:
+        raise ValueError(f"unsupported outcome: {outcome}")
+
+    first = run_exchange(
+        message,
+        bundle,
+        LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
+        destination,
+        evaluation_time=EVAL,
+        manifest=manifest,
+        store_path=store_path,
+        resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
+        mutate_resolver_after_decision=mutate,
+        lose_ack=lose_ack,
+        partial_delivery=partial,
+    )
+    if outcome in {"restart_reconciliation", "duplicate_delivery"}:
+        if outcome == "restart_reconciliation":
+            destination = runtime["DurableRefundDestination"](destination.root)
+        return run_exchange(
+            message,
+            bundle,
+            LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
+            destination,
+            evaluation_time=EVAL,
+            manifest=manifest,
+            store_path=store_path,
+            resolver=resolver,
+            execution_policy_factory=synthetic_refund_policy,
+        )
+    return first
 
 def run_demo(manifest_path: str, replay_path: str, out_path: str) -> dict[str, Any]:
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     bundle = json.loads(Path(replay_path).read_text(encoding="utf-8"))
     tmp = Path(out_path).parent
+    from .synthetic_fixture import build_synthetic_resolver, synthetic_refund_policy
+
     proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_actual_pinned_moltbot_helpers()
-    destination = h.DurableRefundDestination(tmp / "demo-moltbot-state")
-    result = run_exchange(make_message(bundle), bundle, LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"), destination, evaluation_time=EVAL, manifest=manifest, store_path=tmp / "demo_exchange.sqlite", resolver=resolver)
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    runtime = load_executor_runtime()
+    destination = runtime["DurableRefundDestination"](tmp / "demo-moltbot-state")
+    result = run_exchange(
+        make_message(bundle),
+        bundle,
+        LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
+        destination,
+        evaluation_time=EVAL,
+        manifest=manifest,
+        store_path=tmp / "demo_exchange.sqlite",
+        resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
+    )
     Path(out_path).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     return result
 

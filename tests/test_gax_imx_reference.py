@@ -9,11 +9,10 @@ import pytest
 
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     LocalRegistry,
-    _build_resolver,
+    load_executor_runtime,
     actual_executor_classes,
     assess_message,
     digest,
-    load_actual_pinned_moltbot_helpers,
     load_successor_packet,
     make_message,
     make_successor_packet,
@@ -21,6 +20,11 @@ from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     run_actual_outcome,
     run_exchange,
     runtime_proposal_model,
+)
+
+from experiments.odex_gax_imx_reference.synthetic_fixture import (
+    build_synthetic_resolver,
+    synthetic_refund_policy,
 )
 
 EVAL = "2026-08-08T01:00:00Z"
@@ -47,9 +51,9 @@ def registry() -> LocalRegistry:
 def _runtime_fixture(tmp_path: Path, bundle: dict | None = None):
     bundle = bundle or success_bundle()
     proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_actual_pinned_moltbot_helpers()
-    destination = h.DurableRefundDestination(tmp_path / "moltbot-state")
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    runtime = load_executor_runtime()
+    destination = runtime["DurableRefundDestination"](tmp_path / "moltbot-state")
     return resolver, destination
 
 
@@ -64,7 +68,6 @@ def _effect_rows(destination):
 def test_imports_actual_pinned_moltbot_executor_classes():
     classes = actual_executor_classes()
     assert classes["PinnedControlPlaneExecutor"].__module__ == "engine.control_plane_adapter"
-    assert classes["ControlPlaneRefundDestinationAdapter"].__module__ == "engine.control_plane_adapter"
     assert classes["DurableRefundDestination"].__module__ == "engine.safe_executor"
 
 
@@ -79,6 +82,7 @@ def test_run_exchange_success_uses_assessed_request_supplied_resolver_destinatio
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
     )
     assert result["execution"]["attempt_status"] == "executed"
     assert result["execution"]["newly_executed"] is True
@@ -117,8 +121,8 @@ def test_run_exchange_altered_actor_principal_or_scope_cannot_acquire_authority(
         proposal["principal"] = "urn:cognous:principal:attacker"
     else:
         proposal["requested_permissions"] = ["refund.issue.high"]
-    h = load_actual_pinned_moltbot_helpers()
-    destination = h.DurableRefundDestination(tmp_path / mutation / "moltbot-state")
+    runtime = load_executor_runtime()
+    destination = runtime["DurableRefundDestination"](tmp_path / mutation / "moltbot-state")
     result = run_exchange(
         make_message(trial),
         trial,
@@ -128,6 +132,7 @@ def test_run_exchange_altered_actor_principal_or_scope_cannot_acquire_authority(
         manifest=manifest(),
         store_path=tmp_path / mutation / "exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
     )
     assert result["execution"]["attempted"] is False
     assert result["assessment"]["stages"]["authority"] in {"hold", "denied"}
@@ -151,6 +156,7 @@ def test_run_exchange_revocation_after_decision_prevents_execution(tmp_path):
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
         mutate_resolver_after_decision=revoke,
     )
     assert result["execution"]["attempt_status"] == "denied"
@@ -170,14 +176,15 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
         lose_ack=True,
     )
     assert first["execution"]["attempt_status"] == "unknown"
     assert first["successor_packet"]["unresolved_delivery"] is True
     assert len(_effect_rows(destination)) == 1
 
-    h = load_actual_pinned_moltbot_helpers()
-    restarted_destination = h.DurableRefundDestination(destination.root)
+    runtime = load_executor_runtime()
+    restarted_destination = runtime["DurableRefundDestination"](destination.root)
     resolver2, _ = _runtime_fixture(tmp_path / "second")
     second = run_exchange(
         make_message(success_bundle(), message_id="m2"),
@@ -188,6 +195,7 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver2,
+        execution_policy_factory=synthetic_refund_policy,
     )
     assert second["execution"]["attempt_status"] == "reconciled"
     assert second["execution"]["newly_executed"] is False
@@ -203,6 +211,7 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver3,
+        execution_policy_factory=synthetic_refund_policy,
     )
     assert exact_redelivery["execution"]["attempt_status"] == "reconciled"
     assert len(_effect_rows(restarted_destination)) == 1
@@ -219,6 +228,7 @@ def test_run_exchange_partial_delivery_successor_reports_pending_unresolved_effe
         manifest=manifest(),
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
         partial_delivery=True,
     )
     assert result["execution"]["attempt_status"] == "partial"
@@ -229,12 +239,11 @@ def test_run_exchange_partial_delivery_successor_reports_pending_unresolved_effe
 
 def test_success_uses_actual_executor_and_replay_odes_pipeline(tmp_path):
     outcome = run_actual_outcome(tmp_path, "success")
-    result = outcome["result"]
-    assert result.status == "executed"
-    assert result.newly_executed is True
-    assert len(outcome["destination_effects"]) == 1
-    assert any(r.record_type == "runtime_decision" for r in outcome["reconstruction"].records)
-    assert any(r.record_type == "destination_effect" for r in outcome["reconstruction"].records)
+    assert outcome["execution"]["attempt_status"] == "executed"
+    assert outcome["execution"]["newly_executed"] is True
+    assert len(outcome["execution_facts"]["destination_effects"]) == 1
+    assert any(r["record_type"] == "runtime_decision" for r in outcome["current_reconstruction_bundle"]["records"])
+    assert any(r["record_type"] == "destination_effect" for r in outcome["current_reconstruction_bundle"]["records"])
     assert outcome["successor_packet"] is not None
     validation = outcome["odes_reference"]["recipient_validation"]
     assert validation["schema_validity"]["status"] == "pass"
@@ -271,57 +280,118 @@ def test_odes_package_is_not_mutated_after_export(tmp_path):
 )
 def test_pipeline_exists_for_supported_outcomes(tmp_path, outcome, expected_status, expected_effects):
     result = run_actual_outcome(tmp_path / outcome, outcome)
-    assert result["status"] == expected_status
-    assert len(result["destination_effects"]) == expected_effects
-    assert result["reconstruction_bundle"]["records"]
+    assert result["execution"]["attempt_status"] == expected_status
+    assert len(result["execution_facts"]["destination_effects"]) == expected_effects
+    assert result["current_reconstruction_bundle"]["records"]
     assert result["successor_packet"] is not None
     assert result["odes_reference"]["recipient_validation"]["package_content_integrity"]["status"] == "pass"
     if outcome == "partial":
         assert result["execution_facts"]["destination_observed"] == "partial"
         assert result["successor_packet"]["pending_effects"]
     if outcome in {"restart_reconciliation", "duplicate_delivery"}:
-        assert result["result"].newly_executed is False
-        assert result["result"].attempt_id is not None
+        assert result["execution"]["newly_executed"] is False
+        assert result["execution"]["attempt_id"] is not None
 
 
 def test_identical_refund_content_with_different_operation_identity_does_not_reconcile(tmp_path):
-    h = load_actual_pinned_moltbot_helpers()
-    helper, proposal, resolver, workflow, decision, destination, executor, request = h._integrated(tmp_path)
-    first = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    assert first.status == "executed"
-    changed_op = h.ExecutionOperation(
+    runtime = load_executor_runtime()
+    producer = runtime["producer"]
+    from engine.safe_executor import LocalDestinationExecutor, snapshot_envelope
+
+    op = runtime["ExecutionOperation"](
+        actor="urn:cognous:identity:agent-1",
+        principal="urn:cognous:principal:service",
+        institution_id="urn:cognous:institution:demo",
+        authority_domain="customer-refunds",
+        manifest_id="refund-integration-v1-1",
+        manifest_version="1.1",
+        manifest_digest="sha256:" + "a" * 64,
+        proposal_commitment="sha256:" + "b" * 64,
+        action_id="refund.issue",
+        adapter_id="urn:cognous:adapter:synthetic-refund",
+        target="urn:cognous:synthetic-account:customer-1",
+        payload={"refund_reason": "same"},
+        payload_commitment=producer.commitment({"refund_reason": "same"}),
+        requested_permissions=("refund.issue",),
+        amount=50.0,
+        unit="USD",
+        effects=1,
+        authority_context_id="urn:cognous:authority-context:refund-demo",
+        requirement_id="urn:cognous:requirement:refund-t1",
+        grant_id="urn:cognous:grant:refund-1",
+        grant_revision="1",
+        effective_max_effects=1,
+    )
+    destination = runtime["DurableRefundDestination"](tmp_path / "state")
+    executor = LocalDestinationExecutor(destination, synthetic_refund_policy(op))
+    request = runtime["ExecutionEnvelope"]("0.2.0", "decision-1", "effect-1", op)
+    assert executor.execute_snapshot(snapshot_envelope(request)).status == "executed"
+
+    changed_op = runtime["ExecutionOperation"](
         **{
-            **request.operation.__dict__,
+            **op.__dict__,
             "grant_id": "urn:cognous:grant:other",
             "grant_revision": "2",
             "proposal_commitment": "sha256:" + "9" * 64,
         }
     )
-    changed = h.ExecutionEnvelope(request.version, request.decision_id, request.effect_id, changed_op)
+    changed = runtime["ExecutionEnvelope"]("0.2.0", "decision-1", "effect-1", changed_op)
     with pytest.raises(PermissionError):
-        h.LocalDestinationExecutor(destination, h.policy(changed_op)).observe_historical(changed)
+        LocalDestinationExecutor(destination, synthetic_refund_policy(changed_op)).observe_historical(changed)
     assert len(_effect_rows(destination)) == 1
 
 
 def test_unrelated_existing_effect_is_not_reused_when_current_operation_fails(tmp_path):
-    h = load_actual_pinned_moltbot_helpers()
-    helper, proposal, resolver, workflow, decision, destination, executor, request = h._integrated(tmp_path)
-    assert executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW).status == "executed"
-    other_op = h.ExecutionOperation(
+    runtime = load_executor_runtime()
+    producer = runtime["producer"]
+    from engine.safe_executor import LocalDestinationExecutor, snapshot_envelope
+
+    op = runtime["ExecutionOperation"](
+        actor="urn:cognous:identity:agent-1",
+        principal="urn:cognous:principal:service",
+        institution_id="urn:cognous:institution:demo",
+        authority_domain="customer-refunds",
+        manifest_id="refund-integration-v1-1",
+        manifest_version="1.1",
+        manifest_digest="sha256:" + "a" * 64,
+        proposal_commitment="sha256:" + "b" * 64,
+        action_id="refund.issue",
+        adapter_id="urn:cognous:adapter:synthetic-refund",
+        target="urn:cognous:synthetic-account:customer-1",
+        payload={"refund_reason": "first"},
+        payload_commitment=producer.commitment({"refund_reason": "first"}),
+        requested_permissions=("refund.issue",),
+        amount=50.0,
+        unit="USD",
+        effects=1,
+        authority_context_id="urn:cognous:authority-context:refund-demo",
+        requirement_id="urn:cognous:requirement:refund-t1",
+        grant_id="urn:cognous:grant:refund-1",
+        grant_revision="1",
+        effective_max_effects=1,
+    )
+    destination = runtime["DurableRefundDestination"](tmp_path / "state")
+    executor = LocalDestinationExecutor(destination, synthetic_refund_policy(op))
+    request = runtime["ExecutionEnvelope"]("0.2.0", "decision-1", "effect-1", op)
+    assert executor.execute_snapshot(snapshot_envelope(request)).status == "executed"
+
+    other_payload = {"refund_reason": "other"}
+    other_op = runtime["ExecutionOperation"](
         **{
-            **request.operation.__dict__,
+            **op.__dict__,
             "target": "urn:cognous:synthetic-account:customer-999",
-            "payload": {"refund_reason": "other"},
-            "payload_commitment": h.commitment({"refund_reason": "other"}),
-            "proposal_commitment": h.commitment({"unrelated": True}),
+            "payload": other_payload,
+            "payload_commitment": producer.commitment(other_payload),
+            "proposal_commitment": producer.commitment({"unrelated": True}),
         }
     )
-    other_request = h.ExecutionEnvelope(request.version, "decision-other", "effect-other", other_op)
-    other_result = h.LocalDestinationExecutor(destination, h.policy(other_op)).execute_snapshot(h.snapshot_envelope(other_request))
+    other_request = runtime["ExecutionEnvelope"]("0.2.0", "decision-other", "effect-other", other_op)
+    other_result = LocalDestinationExecutor(
+        destination, synthetic_refund_policy(other_op)
+    ).execute_snapshot(snapshot_envelope(other_request))
     assert other_result.status == "failed"
     assert other_result.newly_executed is False
-    assert {row["effect_id"] for row in _effect_rows(destination)} == {decision.effect_id}
-
+    assert {row["effect_id"] for row in _effect_rows(destination)} == {"effect-1"}
 
 def test_gax_assessment_rejects_message_tampering_without_effect():
     bundle = success_bundle()

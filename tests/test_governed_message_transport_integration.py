@@ -15,11 +15,15 @@ from experiments.governed_message_transport import (
 )
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     LocalRegistry,
-    _build_resolver,
-    load_actual_pinned_moltbot_helpers,
+    load_executor_runtime,
     make_message,
     parse_time,
     runtime_proposal_model,
+)
+
+from experiments.odex_gax_imx_reference.synthetic_fixture import (
+    build_synthetic_resolver,
+    synthetic_refund_policy,
 )
 
 EVAL = "2026-08-08T01:00:00Z"
@@ -59,9 +63,9 @@ def test_transport_to_accepted_gax_assessment_lost_ack_restart_no_second_effect(
     manifest = _load_env("UPSTREAM_MANIFEST_EXAMPLE")
     bundle = _load_env("UPSTREAM_REPLAY_SUCCESS_EXAMPLE")
     proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_actual_pinned_moltbot_helpers()
-    destination = h.DurableRefundDestination(tmp_path / "moltbot-state")
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    runtime = load_executor_runtime()
+    destination = runtime["DurableRefundDestination"](tmp_path / "moltbot-state")
     registry = LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient")
     handler = AcceptedGaxRecipientAdapter(
         bundle=bundle,
@@ -70,6 +74,7 @@ def test_transport_to_accepted_gax_assessment_lost_ack_restart_no_second_effect(
         manifest=manifest,
         exchange_store_path=tmp_path / "gax-exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
         destination=destination,
     )
     ids = iter(["transport-attempt-1", "transport-attempt-2"])
@@ -127,9 +132,9 @@ def _accepted_fixture(tmp_path: Path):
     manifest = _load_env("UPSTREAM_MANIFEST_EXAMPLE")
     bundle = _load_env("UPSTREAM_REPLAY_SUCCESS_EXAMPLE")
     proposal = runtime_proposal_model(bundle)
-    resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_actual_pinned_moltbot_helpers()
-    destination = h.DurableRefundDestination(tmp_path / "moltbot-state")
+    resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
+    runtime = load_executor_runtime()
+    destination = runtime["DurableRefundDestination"](tmp_path / "moltbot-state")
     registry = LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient")
     handler = AcceptedGaxRecipientAdapter(
         bundle=bundle,
@@ -138,6 +143,7 @@ def _accepted_fixture(tmp_path: Path):
         manifest=manifest,
         exchange_store_path=tmp_path / "gax-exchange.sqlite",
         resolver=resolver,
+        execution_policy_factory=synthetic_refund_policy,
         destination=destination,
     )
     return bundle, handler, destination
