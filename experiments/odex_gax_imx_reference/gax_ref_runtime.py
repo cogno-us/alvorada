@@ -52,7 +52,10 @@ def _reconciled_result(
     original_bundle: dict[str, Any],
     reason: str,
 ) -> dict[str, Any]:
-    assessment["stages"]["authority"] = "authorized"
+    if getattr(decision, "result", None) == "authorized":
+        assessment["stages"]["authority"] = "authorized"
+    else:
+        assessment["stages"]["authority"] = "reconciled_existing_without_new_authorization"
     return {
         "assessment": assessment,
         "execution": {
@@ -113,17 +116,9 @@ def run_exchange(
     flow = cp["BoundedAuthorizationWorkflow"](manifest=manifest, resolver=resolver, destination=destination.adapter, records=record_store)
     decision = flow.decide(proposal, now=parse_time(evaluation_time))
 
-    if decision.result != "authorized":
-        assessment["stages"]["authority"] = decision.result
-        return {
-            "assessment": assessment,
-            "execution": {"attempted": False, "reason": ";".join(decision.reasons), "decision_id": decision.decision_id},
-            "current_reconstruction_bundle": base._reconstruction_from_run(manifest, proposal, decision, record_store.load(), destination, original_bundle=bundle),
-        }
-
-    if mutate_resolver_after_decision:
-        mutate_resolver_after_decision(resolver)
-
+    # Durable recovery: if this exact operation is already present at the destination,
+    # reconcile it instead of using a new message or new Control Plane decision to
+    # consume another grant/effect. This does not renew authority or create a new effect.
     existing_effect = _matching_existing_effect(destination, proposal)
     if existing_effect:
         return _reconciled_result(
@@ -137,6 +132,17 @@ def run_exchange(
             original_bundle=bundle,
             reason="matching_effect_already_committed",
         )
+
+    if decision.result != "authorized":
+        assessment["stages"]["authority"] = decision.result
+        return {
+            "assessment": assessment,
+            "execution": {"attempted": False, "reason": ";".join(decision.reasons), "decision_id": decision.decision_id},
+            "current_reconstruction_bundle": base._reconstruction_from_run(manifest, proposal, decision, record_store.load(), destination, original_bundle=bundle),
+        }
+
+    if mutate_resolver_after_decision:
+        mutate_resolver_after_decision(resolver)
 
     same_effect, err = store.bind_effect(decision.effect_id, op_hash)
     if err:
