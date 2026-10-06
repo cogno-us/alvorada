@@ -253,7 +253,7 @@ def _build_request_from_decision(proposal: Any, resolver: Any, decision: Any) ->
         manifest_id=proposal.manifest_id,
         manifest_version=proposal.manifest_version,
         manifest_digest=proposal.manifest_digest,
-        proposal_commitment=h.commitment(proposal.model_dump(mode="json", exclude_none=False)),
+        proposal_commitment=h.cp_commitment(proposal.model_dump(mode="json", exclude_none=False)),
         action_id=proposal.action_id,
         adapter_id=proposal.adapter_id,
         target=proposal.target,
