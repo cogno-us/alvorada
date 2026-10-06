@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib
 import importlib.util
 import json
 import os
@@ -64,9 +65,10 @@ def load_actual_pinned_moltbot_helpers():
 
 def actual_executor_classes() -> dict[str, Any]:
     h = load_actual_pinned_moltbot_helpers()
+    adapter_mod = importlib.import_module("engine.control_plane_adapter")
     return {
         "PinnedControlPlaneExecutor": h.PinnedControlPlaneExecutor,
-        "ControlPlaneRefundDestinationAdapter": h.ControlPlaneRefundDestinationAdapter,
+        "ControlPlaneRefundDestinationAdapter": adapter_mod.ControlPlaneRefundDestinationAdapter,
         "DurableRefundDestination": h.DurableRefundDestination,
         "ExecutionEnvelope": h.ExecutionEnvelope,
         "ExecutionOperation": h.ExecutionOperation,
@@ -163,13 +165,7 @@ def _pipeline(manifest: dict[str, Any], cp_record: dict[str, Any], proposal: dic
     successor = None
     if predecessor is not None:
         successor = make_successor_packet(predecessor, facts=facts, state_version=1, current_bundle=bundle)
-    return {
-        "reconstruction": reconstructed,
-        "reconstruction_bundle": bundle,
-        "odes_reference": odes,
-        "successor_packet": successor,
-        "execution_facts": facts,
-    }
+    return {"reconstruction": reconstructed, "reconstruction_bundle": bundle, "odes_reference": odes, "successor_packet": successor, "execution_facts": facts}
 
 
 def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
@@ -189,7 +185,6 @@ def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
         return {"status": decision.result, "decision": decision, "destination_effects": {}, **pipe}
 
     h, helper, proposal, resolver, workflow, decision, destination, executor, request = _build_success_context(tmp_path)
-    result = None
     if outcome == "success":
         result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
     elif outcome == "denied_after_decision":
@@ -199,13 +194,12 @@ def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
     elif outcome == "lost_ack":
         result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="lost_ack")
     elif outcome == "restart_reconciliation":
-        first = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="lost_ack")
-        restarted_destination = h.DurableRefundDestination(destination.root)
-        restarted_executor = h.PinnedControlPlaneExecutor(workflow=workflow, destination=restarted_destination, policy=h.policy(request.operation))
-        result = restarted_executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-        destination = restarted_destination
+        executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="lost_ack")
+        destination = h.DurableRefundDestination(destination.root)
+        executor = h.PinnedControlPlaneExecutor(workflow=workflow, destination=destination, policy=h.policy(request.operation))
+        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
     elif outcome == "duplicate_delivery":
-        first = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
+        executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
         result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
     elif outcome == "partial":
         result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="partial")
@@ -214,15 +208,7 @@ def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
 
     cp, p, m = _export_sources(workflow, proposal, request, result, destination)
     pipe = _pipeline(manifest, cp, p, m)
-    return {
-        "status": result.status,
-        "result": result,
-        "decision": decision,
-        "request": request,
-        "destination": destination,
-        "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)},
-        **pipe,
-    }
+    return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, **pipe}
 
 
 def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False) -> dict[str, Any]:
@@ -291,8 +277,7 @@ class TransactionalExchangeStore:
             return False, None
 
     def accept_successor(self, packet: dict[str, Any], predecessor: dict[str, Any]) -> dict[str, Any]:
-        packet_material = {k: v for k, v in packet.items() if k != "packet_digest"}
-        if packet.get("packet_digest") != digest(packet_material):
+        if packet.get("packet_digest") != digest({k: v for k, v in packet.items() if k != "packet_digest"}):
             return {"loaded": False, "effect_created": False, "status": "packet_digest_mismatch"}
         if packet.get("profile") != PROFILE or packet.get("schema_version") != PROTOCOL_VERSION:
             return {"loaded": False, "effect_created": False, "status": "unsupported_profile_or_schema"}
@@ -321,14 +306,18 @@ class TransactionalExchangeStore:
                 if packet.get("source_packet_id") != head["packet_id"]:
                     conn.execute("ROLLBACK")
                     return {"loaded": False, "effect_created": False, "status": "source_not_accepted_head"}
-                if digest(predecessor) != head["packet_digest"]:
+                predecessor_head_digest = predecessor.get("packet_digest") or digest(predecessor)
+                if predecessor_head_digest != head["packet_digest"]:
                     conn.execute("ROLLBACK")
                     return {"loaded": False, "effect_created": False, "status": "predecessor_content_not_accepted_head"}
                 if version <= int(head["state_version"]):
                     conn.execute("ROLLBACK")
                     return {"loaded": False, "effect_created": False, "status": "stale_or_rollback"}
             elif parent:
+                parent_row = conn.execute("SELECT conversation_id FROM lineage WHERE packet_id=?", (parent,)).fetchone()
                 conn.execute("ROLLBACK")
+                if parent_row and parent_row["conversation_id"] != conversation_id:
+                    return {"loaded": False, "effect_created": False, "status": "conversation_mismatch"}
                 return {"loaded": False, "effect_created": False, "status": "unknown_predecessor"}
             existing = conn.execute("SELECT packet_digest FROM lineage WHERE packet_id=?", (packet["packet_id"],)).fetchone()
             if existing and existing["packet_digest"] != packet["packet_digest"]:
@@ -372,15 +361,7 @@ def run_demo(manifest_path: str, replay_path: str, out_path: str) -> dict[str, A
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     bundle = json.loads(Path(replay_path).read_text(encoding="utf-8"))
     tmp = Path(out_path).parent
-    result = run_exchange(
-        make_message(bundle),
-        bundle,
-        LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
-        None,
-        evaluation_time=EVAL,
-        manifest=manifest,
-        store_path=tmp / "demo_exchange.sqlite",
-    )
+    result = run_exchange(make_message(bundle), bundle, LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"), None, evaluation_time=EVAL, manifest=manifest, store_path=tmp / "demo_exchange.sqlite")
     Path(out_path).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     return result
 
