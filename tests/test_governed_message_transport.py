@@ -18,6 +18,7 @@ from experiments.governed_message_transport import (
 )
 from experiments.governed_message_transport.transport import (
     ACK_KIND_DURABLE_RECEIPT,
+    ACK_KIND_DURABLE_RECEIPT_UNRESOLVED,
     ACK_KIND_TERMINAL_REJECTION,
     TRANSPORT_PROFILE,
     TRANSPORT_VERSION,
@@ -97,7 +98,7 @@ class DurableFixtureHandler:
                 "CREATE TABLE IF NOT EXISTS effects(effect_id TEXT PRIMARY KEY, message_id TEXT UNIQUE)"
             )
 
-    def handle(self, item: dict) -> RecipientOutcome:
+    def handle(self, item: dict, *, delivery_time: str) -> RecipientOutcome:
         with sqlite3.connect(self.path, isolation_level="IMMEDIATE") as con:
             row = con.execute(
                 "SELECT count FROM calls WHERE message_id=?", (item["message_id"],)
@@ -418,3 +419,244 @@ def test_transport_attempt_namespace_is_distinct_from_executor_attempt_namespace
     assert evidence["delivery_attempts"][0]["transport_attempt_id"] == "delivery-1"
     assert "executor_attempt_id" not in evidence["delivery_attempts"][0]
     assert "linked only when returned by the recipient producer" in evidence["namespace_rule"]
+
+
+
+def test_expiry_substitution_rejected_before_handler(tmp_path):
+    handler = DurableFixtureHandler(tmp_path / "effects.sqlite")
+    t = transport(tmp_path, handler)
+    item = message(expires_at="2026-10-06T12:01:00Z")
+    route = route_table().resolve("local-a-b")
+    env = make_transport_envelope(
+        governed_message=item,
+        route=route,
+        delivery_attempt_id="expiry-substitution",
+        correlation_id="c",
+        created_at=NOW,
+    )
+    env["expires_at"] = "2030-01-01T00:00:00Z"
+    ack = t.receive_envelope(env, now="2026-10-06T12:02:00Z")
+    assert ack["acknowledgement_kind"] == ACK_KIND_TERMINAL_REJECTION
+    assert ack["detail"]["reason"] == "envelope_message_expiry_mismatch"
+    assert handler.call_count(item["message_id"]) == 0
+    assert handler.effects() == []
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("created_at", "not-a-time", "Invalid isoformat string"),
+        ("created_at", "2026-10-06T12:00:00", "timestamp must be timezone-aware"),
+        ("created_at", "2026-10-06T12:00:01Z", "envelope_created_at_in_future"),
+    ],
+)
+def test_envelope_timestamp_policy_rejects_malformed_timezone_free_and_future(
+    tmp_path, field, value, reason
+):
+    handler = DurableFixtureHandler(tmp_path / "effects.sqlite")
+    t = transport(tmp_path, handler)
+    item = message()
+    route = route_table().resolve("local-a-b")
+    env = make_transport_envelope(
+        governed_message=item,
+        route=route,
+        delivery_attempt_id="bad-time",
+        correlation_id="c",
+        created_at=NOW,
+    )
+    env[field] = value
+    ack = t.receive_envelope(env, now=NOW)
+    assert ack["acknowledgement_kind"] == ACK_KIND_TERMINAL_REJECTION
+    assert reason in ack["detail"]["reason"]
+    assert handler.call_count(item["message_id"]) == 0
+
+
+def test_governed_future_created_at_rejected_before_handler(tmp_path):
+    handler = DurableFixtureHandler(tmp_path / "effects.sqlite")
+    t = transport(tmp_path, handler)
+    item = message()
+    item["created_at"] = "2026-10-06T12:00:01Z"
+    item["message_digest"] = commitment(
+        {k: v for k, v in item.items() if k != "message_digest"}
+    )
+    route = route_table().resolve("local-a-b")
+    env = make_transport_envelope(
+        governed_message=item,
+        route=route,
+        delivery_attempt_id="future-message",
+        correlation_id="c",
+        created_at=NOW,
+    )
+    ack = t.receive_envelope(env, now=NOW)
+    assert ack["acknowledgement_kind"] == ACK_KIND_TERMINAL_REJECTION
+    assert ack["detail"]["reason"] == "message_created_at_in_future"
+    assert handler.call_count(item["message_id"]) == 0
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("message_id", "other-message", "message_identity_mismatch"),
+        ("conversation_id", "other-conversation", "conversation_identity_mismatch"),
+    ],
+)
+def test_envelope_identity_substitution_rejected(tmp_path, field, value, reason):
+    handler = DurableFixtureHandler(tmp_path / "effects.sqlite")
+    t = transport(tmp_path, handler)
+    item = message()
+    route = route_table().resolve("local-a-b")
+    env = make_transport_envelope(
+        governed_message=item,
+        route=route,
+        delivery_attempt_id="substitution",
+        correlation_id="c",
+        created_at=NOW,
+    )
+    env[field] = value
+    ack = t.receive_envelope(env, now=NOW)
+    assert ack["acknowledgement_kind"] == ACK_KIND_TERMINAL_REJECTION
+    assert ack["detail"]["reason"] == reason
+    assert handler.call_count(item["message_id"]) == 0
+
+
+def test_interruption_after_receipt_redelivery_is_unresolved_not_rejection(tmp_path):
+    handler = DurableFixtureHandler(tmp_path / "effects.sqlite")
+    t = transport(tmp_path, handler)
+    item = message(message_id="receipt-interrupt")
+    queue(t, item)
+    first = t.deliver(item["message_id"], now=NOW, fault_after_receipt=True)
+    assert first["transport_state"] == "PENDING_RETRY"
+    assert handler.call_count(item["message_id"]) == 0
+    assert handler.effects() == []
+    assert t.recipient_store.inbox_record(item["message_id"]) is not None
+
+    second = t.deliver(item["message_id"], now=LATER)
+    assert second["transport_state"] == "UNRESOLVED"
+    assert second["acknowledgement"]["acknowledgement_kind"] == ACK_KIND_DURABLE_RECEIPT_UNRESOLVED
+    assert second["acknowledgement"]["detail"]["reason"] == "durable_receipt_without_recipient_outcome"
+    assert handler.call_count(item["message_id"]) == 0
+    assert handler.effects() == []
+    assert t.evidence(item["message_id"])["recipient_processing_status"] == "unresolved_after_durable_receipt"
+
+
+def test_interruption_after_effect_before_outcome_persistence_does_not_repeat_effect(tmp_path):
+    handler = DurableFixtureHandler(tmp_path / "effects.sqlite")
+    t = transport(tmp_path, handler)
+    item = message(message_id="effect-interrupt")
+    queue(t, item)
+    first = t.deliver(item["message_id"], now=NOW, fault_after_handler=True)
+    assert first["transport_state"] == "PENDING_RETRY"
+    assert handler.call_count(item["message_id"]) == 1
+    assert handler.effects() == [("effect-effect-interrupt", "effect-interrupt")]
+
+    second = t.deliver(item["message_id"], now=LATER)
+    assert second["transport_state"] == "UNRESOLVED"
+    assert second["acknowledgement"]["acknowledgement_kind"] == ACK_KIND_DURABLE_RECEIPT_UNRESOLVED
+    assert handler.call_count(item["message_id"]) == 1
+    assert handler.effects() == [("effect-effect-interrupt", "effect-interrupt")]
+    assert second["acknowledgement"]["detail"]["execution"] == "not_established"
+
+
+def multi_sender_routes() -> TrustedRouteTable:
+    return TrustedRouteTable(
+        [
+            Route(
+                route_id="sender-a",
+                sender_endpoint_ref="local://sender-a",
+                sender_identity_ref="urn:cognous:transport-identity:agent-a",
+                expected_sender_claim="agent-a",
+                recipient_endpoint_ref="local://recipient-b",
+                recipient_identity_ref="urn:cognous:transport-identity:agent-b",
+                expected_recipient_claim="agent-b",
+                configured_identity_authenticated=False,
+            ),
+            Route(
+                route_id="sender-c",
+                sender_endpoint_ref="local://sender-c",
+                sender_identity_ref="urn:cognous:transport-identity:agent-c",
+                expected_sender_claim="agent-c",
+                recipient_endpoint_ref="local://recipient-b",
+                recipient_identity_ref="urn:cognous:transport-identity:agent-b",
+                expected_recipient_claim="agent-b",
+                configured_identity_authenticated=False,
+            ),
+        ]
+    )
+
+
+def test_multiple_valid_senders_share_recipient_without_first_route_bias(tmp_path):
+    handler = DurableFixtureHandler(tmp_path / "effects.sqlite")
+    routes = multi_sender_routes()
+    t = LocalDurableTransport(
+        sender_store_path=tmp_path / "sender.sqlite",
+        recipient_store_path=tmp_path / "recipient.sqlite",
+        routes=routes,
+        recipient_handler=handler,
+        attempt_id_factory=lambda: "delivery-c",
+        ack_id_factory=lambda: "ack-c",
+    )
+    item = message(message_id="from-c", sender="agent-c")
+    t.queue(
+        item,
+        route_id="sender-c",
+        sender_endpoint_ref="local://sender-c",
+        now=NOW,
+    )
+    result = t.deliver(item["message_id"], now=NOW)
+    assert result["transport_state"] == "DELIVERED"
+    assert handler.call_count(item["message_id"]) == 1
+    assert handler.effects() == [("effect-from-c", "from-c")]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("sender_endpoint_ref", "local://sender-a"),
+        ("sender_identity_ref", "urn:cognous:transport-identity:agent-a"),
+    ],
+)
+def test_multi_sender_route_substitution_rejected(tmp_path, field, value):
+    handler = DurableFixtureHandler(tmp_path / "effects.sqlite")
+    routes = multi_sender_routes()
+    t = LocalDurableTransport(
+        sender_store_path=tmp_path / "sender.sqlite",
+        recipient_store_path=tmp_path / "recipient.sqlite",
+        routes=routes,
+        recipient_handler=handler,
+    )
+    item = message(message_id="route-sub", sender="agent-c")
+    env = make_transport_envelope(
+        governed_message=item,
+        route=routes.resolve("sender-c"),
+        delivery_attempt_id="sub-route",
+        correlation_id=None,
+        created_at=NOW,
+    )
+    env[field] = value
+    ack = t.receive_envelope(env, now=NOW)
+    assert ack["acknowledgement_kind"] == ACK_KIND_TERMINAL_REJECTION
+    assert ack["detail"]["reason"] == "untrusted_or_unknown_route_binding"
+    assert handler.call_count(item["message_id"]) == 0
+
+
+def test_genuinely_ambiguous_route_configuration_rejected():
+    first = Route(
+        route_id="r1",
+        sender_endpoint_ref="local://sender",
+        sender_identity_ref="urn:sender",
+        expected_sender_claim="agent-a",
+        recipient_endpoint_ref="local://recipient",
+        recipient_identity_ref="urn:recipient",
+        expected_recipient_claim="agent-b",
+    )
+    second = Route(
+        route_id="r2",
+        sender_endpoint_ref="local://sender",
+        sender_identity_ref="urn:sender",
+        expected_sender_claim="agent-c",
+        recipient_endpoint_ref="local://recipient",
+        recipient_identity_ref="urn:recipient",
+        expected_recipient_claim="agent-b",
+    )
+    with pytest.raises(ValueError, match="ambiguous transport route binding"):
+        TrustedRouteTable([first, second])
