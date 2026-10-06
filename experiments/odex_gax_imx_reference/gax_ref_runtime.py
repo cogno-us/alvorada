@@ -45,6 +45,10 @@ def load_public_executor_runtime():
     return _load()
 
 
+# Test/source-compatibility alias. This no longer loads any test module.
+load_actual_pinned_moltbot_helpers = load_public_executor_runtime
+
+
 def actual_executor_classes() -> dict[str, Any]:
     h = load_public_executor_runtime()
     return {
@@ -748,47 +752,54 @@ def load_successor_packet(packet: dict[str, Any], destination: Any, *, predecess
 
 
 def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
-    h = load_actual_pinned_moltbot_helpers()
-    helper = h._load_pinned_helpers()
-    manifest = helper.manifest()
-    bundle = json.loads(Path(os.environ["UPSTREAM_REPLAY_SUCCESS_EXAMPLE"]).read_text(encoding="utf-8")) if os.environ.get("UPSTREAM_REPLAY_SUCCESS_EXAMPLE") else {}
-    message = make_message(bundle) if bundle else {"message_id": "fixture-message", "conversation_id": "fixture-conversation"}
-    if outcome == "hold":
-        proposal = helper.proposal()
-        resolver = helper.resolver_for(proposal)
-        grant = resolver.contexts[helper.PROFILE]["grant"]
-        resolver.statuses[grant["grant_id"]].status = "revoked"
-        destination = helper.LocalRefundDestination(tmp_path / "cp-destination.json")
-        records = helper.BoundedRecordStore(tmp_path / "cp-run.json", "run-1")
-        workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=destination, records=records)
-        decision = workflow.decide(proposal, now=helper.NOW)
-        pipe = _pipeline(manifest, workflow.records.load().model_dump(mode="json"), proposal.model_dump(mode="json", exclude_none=False), None, predecessor=message)
-        return {"status": decision.result, "decision": decision, "destination_effects": {}, **pipe}
-    helper, proposal, resolver, workflow, decision, destination, executor, request = h._integrated(tmp_path)
-    if outcome == "success":
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "denied_after_decision":
-        grant = resolver.contexts[helper.PROFILE]["grant"]
-        resolver.statuses[grant["grant_id"]].status = "revoked"
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "lost_ack":
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="lost_ack")
-    elif outcome == "restart_reconciliation":
-        executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="lost_ack")
-        destination = h.DurableRefundDestination(destination.root)
-        executor = h.PinnedControlPlaneExecutor(workflow=workflow, destination=destination, policy=h.policy(request.operation))
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "duplicate_delivery":
-        executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW)
-    elif outcome == "partial":
-        result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=helper.NOW, simulate="partial")
-    else:
-        raise ValueError(f"unsupported outcome: {outcome}")
-    cp, p, m = _export_sources(workflow, proposal, request, result, destination)
-    pipe = _pipeline(manifest, cp, p, m, predecessor=message)
-    return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, **pipe}
+    """Synthetic test fixture only; production run_exchange requires caller resolver."""
+    manifest = _manifest()
+    bundle = json.loads(Path(os.environ["UPSTREAM_REPLAY_SUCCESS_EXAMPLE"]).read_text(encoding="utf-8"))
+    proposal = runtime_proposal_model(bundle)
+    resolver = _build_resolver(proposal, now=parse_time(EVAL))
+    h = load_public_executor_runtime()
+    destination = h.DurableRefundDestination(tmp_path / "moltbot-state")
+    message = make_message(bundle)
+    store = tmp_path / "fixture-exchange.sqlite"
 
+    if outcome == "hold":
+        grant = resolver.contexts[proposal.authority_context_ref]["grant"]
+        resolver.statuses[grant["grant_id"]].status = "revoked"
+        return run_exchange(message, bundle, LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"), destination, evaluation_time=EVAL, manifest=manifest, store_path=store, resolver=resolver)
+    mutate = None
+    lose_ack = outcome in {"lost_ack", "restart_reconciliation"}
+    partial = outcome == "partial"
+    if outcome == "denied_after_decision":
+        def mutate(res):
+            grant = res.contexts[proposal.authority_context_ref]["grant"]
+            res.statuses[grant["grant_id"]].status = "revoked"
+    first = run_exchange(
+        message,
+        bundle,
+        LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
+        destination,
+        evaluation_time=EVAL,
+        manifest=manifest,
+        store_path=store,
+        resolver=resolver,
+        mutate_resolver_after_decision=mutate,
+        lose_ack=lose_ack,
+        partial_delivery=partial,
+    )
+    if outcome in {"duplicate_delivery", "restart_reconciliation"}:
+        return run_exchange(
+            message,
+            bundle,
+            LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"),
+            destination,
+            evaluation_time=EVAL,
+            manifest=manifest,
+            store_path=store,
+            resolver=resolver,
+        )
+    if outcome not in {"success", "denied_after_decision", "lost_ack", "partial"}:
+        raise ValueError(f"unsupported outcome: {outcome}")
+    return first
 
 def run_demo(manifest_path: str, replay_path: str, out_path: str) -> dict[str, Any]:
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
@@ -796,7 +807,7 @@ def run_demo(manifest_path: str, replay_path: str, out_path: str) -> dict[str, A
     tmp = Path(out_path).parent
     proposal = runtime_proposal_model(bundle)
     resolver = _build_resolver(proposal, now=parse_time(EVAL))
-    h = load_actual_pinned_moltbot_helpers()
+    h = load_public_executor_runtime()
     destination = h.DurableRefundDestination(tmp / "demo-moltbot-state")
     result = run_exchange(make_message(bundle), bundle, LocalRegistry({"refund-sender"}, {"refund-recipient"}, "refund-recipient"), destination, evaluation_time=EVAL, manifest=manifest, store_path=tmp / "demo_exchange.sqlite", resolver=resolver)
     Path(out_path).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
