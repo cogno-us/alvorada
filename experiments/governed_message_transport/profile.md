@@ -108,3 +108,35 @@ Unsupported fields remain explicit: cryptographic network authentication, distri
 - The accepted GAX/IMX adapter and its pinned dependencies are relied upon for recipient assessment and execution gating.
 - Institutional authority remains external to transport.
 - No production credentials, public service, public-chain write, or paid service is used.
+
+
+## Correction pass: temporal and recovery rules
+
+The trusted delivery instant is supplied explicitly for each new recipient
+assessment. Constructor-time values are not authorization time. The accepted
+GAX assessment and `run_exchange` receive the trusted delivery instant, so
+Control Plane decision and effect-time revalidation occur against current
+delivery time. Historical transport duplicates with a retained recipient
+outcome are observed from durable recipient state and do not rerun assessment or
+renew authorization.
+
+The local clock policy requires timezone-aware trusted, message and envelope
+timestamps. With the default zero-skew policy:
+
+- envelope and governed-message creation times cannot be in the future;
+- envelope delivery-attempt creation cannot precede governed-message creation;
+- governed expiry must be after governed creation;
+- envelope expiry must equal governed-message expiry;
+- governed expiry is checked directly against trusted delivery time;
+- duplicated `message_id` and `conversation_id` fields must exactly match the
+  governed message before recipient processing.
+
+A durable inbox receipt without retained recipient outcome is
+`DURABLE_RECEIPT_UNRESOLVED`, not terminal rejection and not successful
+processing. Recovery does not rerun recipient execution when the retained
+outcome boundary is missing.
+
+Inbound route selection matches the complete configured transport binding:
+sender endpoint, sender identity reference, recipient endpoint and recipient
+identity reference. Multiple configured senders may share one recipient.
+Duplicate complete bindings are rejected as ambiguous configuration.
