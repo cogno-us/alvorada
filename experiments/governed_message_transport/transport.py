@@ -960,7 +960,7 @@ class LocalDurableTransport:
                     return self._unresolved_receipt_ack(
                         envelope,
                         now=trusted_now,
-                        reason="durable_receipt_without_recoverable_recipient_outcome",
+                        reason="durable_receipt_without_recipient_outcome",
                     )
                 outcome = recover(copy.deepcopy(message), delivery_time=trusted_now)
                 if outcome.artifact_export is None:
