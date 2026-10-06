@@ -16,7 +16,7 @@ PROTOCOL_VERSION = "0.1.0"
 SUPPORTED_TYPES = {"PROPOSE", "REQUEST", "REPORT", "REFUSE", "NOT_UNDERSTOOD"}
 EXECUTION_ELIGIBLE_TYPES = {"PROPOSE", "REQUEST"}
 
-NOW = datetime(2026, 10, 5, 19, 0, tzinfo=timezone.utc)
+DEFAULT_EVALUATION_TIME = datetime(2026, 8, 8, 1, 0, tzinfo=timezone.utc)
 PROFILE_AUTH_CONTEXT = "urn:cognous:alvorada:public-stack-profile:0.1.0"
 INSTITUTION = "urn:cognous:institution:synthetic-customer-service"
 ISSUER = "urn:cognous:principal:synthetic-governor"
@@ -65,6 +65,17 @@ def decision_from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     if not decision:
         raise ValueError("runtime_decision is required")
     return decision
+
+
+def retained_decision_result(bundle: dict[str, Any]) -> str:
+    raw = str(decision_from_bundle(bundle).get("result") or decision_from_bundle(bundle).get("status") or "unknown").lower()
+    if raw in {"authorized", "allow", "granted"}:
+        return "authorized"
+    if raw in {"hold", "held", "requires_review"}:
+        return "hold"
+    if raw in {"deny", "denied", "blocked", "reject"}:
+        return "denied"
+    return raw or "unknown"
 
 
 def _cp():
@@ -323,7 +334,8 @@ def assess_message(message: dict[str, Any], bundle: dict[str, Any], registry: Lo
     return {"permitted_handling": "ACCEPT_FOR_ASSESSMENT", "stages": stages, "errors": errors, "message_received": True, "message_understood": True}
 
 
-def _build_resolver(proposal: Any, *, status: str = "active"):
+def _build_resolver(proposal: Any, *, status: str = "active", now: datetime | None = None):
+    now = now or DEFAULT_EVALUATION_TIME
     c = _cp(); commitment = c["commitment"]
     GrantStatus = c["GrantStatus"]; ApprovalStatus = c["ApprovalStatus"]; IdentityStatus = c["IdentityStatus"]; MandateStatus = c["MandateStatus"]; PolicyStatus = c["PolicyStatus"]; ConflictStatus = c["ConflictStatus"]; EvidenceStatus = c["EvidenceStatus"]; RoleMappingStatus = c["RoleMappingStatus"]; SyntheticResolver = c["SyntheticResolver"]
     role = "urn:cognous:role:customer-service-supervisor"; action_name = "refund_issue_routine"; grant_id = "urn:cognous:grant:routine-1"
@@ -335,20 +347,20 @@ def _build_resolver(proposal: Any, *, status: str = "active"):
         "requirement": {"requirement_id": proposal.requirement_id, "governing_sources": [{"ref": POLICY_REF, "version": POLICY_VERSION, "provision": "refund", "standing": "local_policy"}], "permissions": [{"action": action_name, "targets": [proposal.target], "data_scopes": list(proposal.requested_permissions), "max_amount": max(100.0, float(proposal.amount)), "unit": proposal.unit, "max_effects": 1}], "approvals": [{"role_id": role, "independent_of_actor": True}], "evidence": [{"obligation_id": "urn:cognous:evidence:refund-entitlement", "kind": "authorization", "source_ref": "urn:cognous:source:entitlement", "max_age_seconds": 300, "required": True, "unknown_behavior": "hold_effect"}], "consequence": {"tier": "T1", "rationale": "Synthetic test tier.", "profile_ref": "urn:cognous:consequence:T1"}},
         "conflicts": {"precedence_refs": [POLICY_REF], "incompatible_role_pairs": [], "escalation_ref": "urn:cognous:procedure:escalation", "appeal_ref": "urn:cognous:procedure:appeal", "continuity_ref": "urn:cognous:procedure:continuity", "remedy_ref": "urn:cognous:procedure:remedy"},
         "supporting_evidence_refs": [], "change": {"kind": "none", "proposal_ref": None, "adoption_record_ref": None},
-        "grant": {"grant_id": grant_id, "revision": "1", "requirement_id": proposal.requirement_id, "issuer": ISSUER, "issuer_role": ISSUER_ROLE, "issuance_record_ref": "urn:cognous:issuance:1", "grantee": proposal.principal, "acting_identity": proposal.actor, "issued_at": (NOW - timedelta(hours=1)).isoformat(), "not_before": (NOW - timedelta(minutes=30)).isoformat(), "expires_at": (NOW + timedelta(hours=1)).isoformat(), "status_ref": "urn:cognous:status:grant-1", "policy_versions": [{"ref": POLICY_REF, "version": POLICY_VERSION}], "permissions": [{"action": action_name, "targets": [proposal.target], "data_scopes": list(proposal.requested_permissions), "max_amount": max(100.0, float(proposal.amount)), "unit": proposal.unit, "max_effects": 1}], "delegation": {"parent_grant_id": None, "may_delegate": False, "remaining_depth": 0}, "approval_refs": ["urn:cognous:approval:t1-1"]},
+        "grant": {"grant_id": grant_id, "revision": "1", "requirement_id": proposal.requirement_id, "issuer": ISSUER, "issuer_role": ISSUER_ROLE, "issuance_record_ref": "urn:cognous:issuance:1", "grantee": proposal.principal, "acting_identity": proposal.actor, "issued_at": (now - timedelta(hours=1)).isoformat(), "not_before": (now - timedelta(minutes=30)).isoformat(), "expires_at": (now + timedelta(hours=1)).isoformat(), "status_ref": "urn:cognous:status:grant-1", "policy_versions": [{"ref": POLICY_REF, "version": POLICY_VERSION}], "permissions": [{"action": action_name, "targets": [proposal.target], "data_scopes": list(proposal.requested_permissions), "max_amount": max(100.0, float(proposal.amount)), "unit": proposal.unit, "max_effects": 1}], "delegation": {"parent_grant_id": None, "may_delegate": False, "remaining_depth": 0}, "approval_refs": ["urn:cognous:approval:t1-1"]},
     }
-    aliases = {"customer-service-supervisor": [role]}
+    aliases = {"customer-service-supervisor": [role], "refund-authorizer": ["urn:cognous:role:refund-authorizer"]}
     mapping = RoleMappingStatus(institution_id=INSTITUTION, version="roles-v1", digest=commitment({"institution_id": INSTITUTION, "version": "roles-v1", "aliases": aliases}), aliases=aliases)
     return SyntheticResolver(
         contexts={PROFILE_AUTH_CONTEXT: context},
-        statuses={grant_id: GrantStatus(grant_id=grant_id, revision="1", status=status, observed_at=NOW.isoformat(), version="status-v1", status_ref=context["grant"]["status_ref"], authority_basis_ref="urn:cognous:authority-basis:synthetic", institution_id=INSTITUTION, authority_domain="customer-refunds")},
-        identities={proposal.actor: IdentityStatus(identity=proposal.actor, principal=proposal.principal, authenticated=True, delegation_valid=True, observed_at=NOW.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds", chain=[])},
-        mandates={f"{ISSUER}|{ISSUER_ROLE}": MandateStatus(issuer=ISSUER, issuer_role=ISSUER_ROLE, issuance_record_ref=context["grant"]["issuance_record_ref"], mandate_valid=True, observed_at=NOW.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds")},
-        approvals={"urn:cognous:approval:t1-1": ApprovalStatus(approval_ref="urn:cognous:approval:t1-1", role_id=role, approver="urn:cognous:principal:reviewer-1", grant_id=grant_id, grant_revision="1", proposal_commitment=proposal_commitment(model=proposal), policy_versions=copy.deepcopy(context["grant"]["policy_versions"]), observed_at=NOW.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds")},
-        policies={POLICY_REF: PolicyStatus(ref=POLICY_REF, version=POLICY_VERSION, status="active", observed_at=NOW.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds")},
-        conflicts={proposal.requirement_id: ConflictStatus(requirement_id=proposal.requirement_id, state="clear", observed_at=NOW.isoformat(), conflict_refs=[POLICY_REF], institution_id=INSTITUTION, authority_domain="customer-refunds")},
+        statuses={grant_id: GrantStatus(grant_id=grant_id, revision="1", status=status, observed_at=now.isoformat(), version="status-v1", status_ref=context["grant"]["status_ref"], authority_basis_ref="urn:cognous:authority-basis:synthetic", institution_id=INSTITUTION, authority_domain="customer-refunds")},
+        identities={proposal.actor: IdentityStatus(identity=proposal.actor, principal=proposal.principal, authenticated=True, delegation_valid=True, observed_at=now.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds", chain=[])},
+        mandates={f"{ISSUER}|{ISSUER_ROLE}": MandateStatus(issuer=ISSUER, issuer_role=ISSUER_ROLE, issuance_record_ref=context["grant"]["issuance_record_ref"], mandate_valid=True, observed_at=now.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds")},
+        approvals={"urn:cognous:approval:t1-1": ApprovalStatus(approval_ref="urn:cognous:approval:t1-1", role_id=role, approver="urn:cognous:principal:reviewer-1", grant_id=grant_id, grant_revision="1", proposal_commitment=proposal_commitment(model=proposal), policy_versions=copy.deepcopy(context["grant"]["policy_versions"]), observed_at=now.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds")},
+        policies={POLICY_REF: PolicyStatus(ref=POLICY_REF, version=POLICY_VERSION, status="active", observed_at=now.isoformat(), institution_id=INSTITUTION, authority_domain="customer-refunds")},
+        conflicts={proposal.requirement_id: ConflictStatus(requirement_id=proposal.requirement_id, state="clear", observed_at=now.isoformat(), conflict_refs=[POLICY_REF], institution_id=INSTITUTION, authority_domain="customer-refunds")},
         role_mappings={INSTITUTION: mapping},
-        evidence={"urn:cognous:evidence:refund-entitlement": EvidenceStatus(obligation_id="urn:cognous:evidence:refund-entitlement", state="current", observed_at=NOW.isoformat(), source_ref="urn:cognous:source:entitlement", institution_id=INSTITUTION, authority_domain="customer-refunds")},
+        evidence={"urn:cognous:evidence:refund-entitlement": EvidenceStatus(obligation_id="urn:cognous:evidence:refund-entitlement", state="current", observed_at=now.isoformat(), source_ref="urn:cognous:source:entitlement", institution_id=INSTITUTION, authority_domain="customer-refunds")},
     )
 
 
@@ -373,6 +385,7 @@ def execution_facts(bundle: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: DestinationState, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path | None = None, resolver: Any | None = None, mutate_resolver_after_decision: Callable[[Any], None] | None = None, lose_ack: bool = False, partial_delivery: bool = False) -> dict[str, Any]:
+    eval_dt = parse_time(evaluation_time)
     store_dir = Path(store_path).parent if store_path else Path(tempfile.mkdtemp())
     exchange_store = DurableExchangeStore(Path(store_path) if store_path else store_dir / "exchange-store.json")
     assessment = assess_message(message, bundle, registry, evaluation_time=evaluation_time, seen_messages=exchange_store.seen_messages())
@@ -385,10 +398,14 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
     if assessment["permitted_handling"] != "ACCEPT_FOR_ASSESSMENT":
         return {"assessment": assessment, "execution": {"attempted": False, "reason": assessment["permitted_handling"]}, "destination_state": destination.snapshot(), "facts": execution_facts(bundle)}
     replay_report = validate_replay_source(manifest, bundle)
+    retained = retained_decision_result(bundle)
+    if retained != "authorized":
+        assessment["stages"]["retained_decision"] = retained
+        return {"assessment": assessment, "execution": {"attempted": False, "reason": retained}, "destination_state": destination.snapshot(), "replay_validation": replay_report, "facts": execution_facts(bundle)}
     proposal = runtime_proposal_model(bundle)
-    resolver = resolver or _build_resolver(proposal)
+    resolver = resolver or _build_resolver(proposal, now=eval_dt)
     flow = _workflow(manifest, resolver, destination, store_dir)
-    decision = flow.decide(proposal, now=parse_time(evaluation_time))
+    decision = flow.decide(proposal, now=eval_dt)
     assessment["stages"]["authority"] = decision.result
     if decision.result != "authorized":
         return {"assessment": assessment, "execution": {"attempted": False, "reason": decision.result, "reasons": decision.reasons}, "destination_state": destination.snapshot(), "replay_validation": replay_report, "facts": execution_facts(bundle)}
@@ -399,7 +416,7 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
         assessment["errors"].append(effect_err); assessment["permitted_handling"] = "REFUSE"
         return {"assessment": assessment, "execution": {"attempted": False, "reason": effect_err}, "destination_state": destination.snapshot(), "replay_validation": replay_report}
     try:
-        attempt, observation = flow.execute(proposal, decision, adapter_id=proposal.adapter_id, now=parse_time(evaluation_time), lose_ack=lose_ack, partial=partial_delivery)
+        attempt, observation = flow.execute(proposal, decision, adapter_id=proposal.adapter_id, now=eval_dt, lose_ack=lose_ack, partial=partial_delivery)
     except PermissionError as exc:
         assessment["permitted_handling"] = "REFUSE_AUTHORITY_INVALID"; assessment["errors"].append(str(exc))
         return {"assessment": assessment, "execution": {"attempted": False, "reason": str(exc)}, "destination_state": destination.snapshot(), "replay_validation": replay_report}
