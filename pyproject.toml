@@ -1,0 +1,15 @@
+[project]
+name = "alvorada-gax-imx-reference"
+version = "0.1.0"
+description = "Bounded experimental ODEX-GAX/IMX governed exchange reference"
+requires-python = ">=3.11"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
