@@ -244,7 +244,7 @@ def test_unsupported_versions_and_downgrade_fail():
 
 def test_odes_export_uses_merged_api_and_preserves_outcomes():
     ref = export_odes_reference(manifest(), success_bundle())
-    assert ref["odes_package"]["record"]["schema_version"] == "pder-v0.1"
+    assert ref["odes_package"]["record"]["schema_version"] == "0.1"
     assert "recipient_reliance_decision" in ref["recipient_validation"]
     assert ref["odes_package"]["provenance"]["execution_facts"]["destination_observed"] in {"applied", "partial", "unknown", "unavailable"}
 
