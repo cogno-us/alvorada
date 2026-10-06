@@ -114,3 +114,5 @@ def _recover_checkpoint_with_result_status(
 
 _runtime.TransactionalExchangeStore._association_payload = _checkpoint_aware_association_payload
 _runtime._recover_checkpoint = _recover_checkpoint_with_result_status
+
+from . import semantic_tightening as _semantic_tightening  # noqa: E402,F401
