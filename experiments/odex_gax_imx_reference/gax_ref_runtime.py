@@ -257,11 +257,7 @@ def _run_current_request(
     helper = h._load_pinned_helpers()
     now = parse_time(evaluation_time)
     proposal = runtime_proposal_model(bundle)
-    record_suffix = digest({
-        "message_id": message["message_id"],
-        "message_digest": message.get("message_digest"),
-        "evaluation_time": evaluation_time,
-    })[-16:]
+    record_suffix = digest({"message_id": message["message_id"], "message_digest": message.get("message_digest"), "evaluation_time": evaluation_time})[-16:]
     record_store = helper.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}-{record_suffix}.json", proposal.run_id or "run-gax-imx")
     cp_destination = helper.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}-{record_suffix}.json")
     workflow = helper.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
@@ -328,15 +324,36 @@ def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
     return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, **pipe}
 
 
+def _duplicate_redelivery_result(message: dict[str, Any], assessment: dict[str, Any], destination: Any) -> dict[str, Any]:
+    effects = _effect_rows(destination) if destination is not None else []
+    observed = effects[0]["state"] if effects else "unavailable"
+    effect_id = effects[0]["effect_id"] if effects else None
+    return {
+        "assessment": assessment,
+        "execution": {
+            "attempted": False,
+            "attempt_status": "reconciled" if effects else "duplicate_message",
+            "newly_executed": False,
+            "destination_observed": observed,
+            "effect_id": effect_id,
+            "decision_id": None,
+            "attempt_id": None,
+        },
+        "successor_packet": make_successor_packet(message, facts={"decision_id": None, "pending_effects": [], "attempts": {}, "unresolved_delivery": False}, current_bundle={}) if effects else None,
+    }
+
+
 def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False) -> dict[str, Any]:
     store_path = Path(store_path)
     store = TransactionalExchangeStore(store_path)
-    _, err = store.record_message(message)
+    duplicate, err = store.record_message(message)
     if err:
         return {"assessment": {"permitted_handling": "REFUSE", "errors": [err], "stages": {"identity_binding": "failed"}}, "execution": {"attempted": False, "reason": err}, "successor_packet": None}
     assessment = assess_message(message, bundle, registry, evaluation_time=evaluation_time, seen_messages=store.seen_messages())
     if assessment["permitted_handling"] != "ACCEPT_FOR_ASSESSMENT":
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "message_not_execution_eligible"}, "successor_packet": None}
+    if duplicate:
+        return _duplicate_redelivery_result(message, assessment, destination)
     if resolver is None:
         assessment["errors"].append("GAX-AUTHORITY-TRUSTED-RESOLVER-REQUIRED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "trusted_resolver_required"}, "successor_packet": None}
@@ -399,10 +416,10 @@ class TransactionalExchangeStore:
             return {"loaded": False, "effect_created": False, "status": "conversation_mismatch"}
         if packet.get("source_packet_id") not in {predecessor.get("message_id"), predecessor.get("packet_id")}:
             return {"loaded": False, "effect_created": False, "status": "source_identity_mismatch"}
-        if predecessor.get("packet_digest") and predecessor.get("packet_digest") != self._material_digest(predecessor):
-            return {"loaded": False, "effect_created": False, "status": "predecessor_digest_mismatch"}
-        predecessor_digest = predecessor.get("packet_digest") or self._material_digest(predecessor)
-        if packet.get("source_commitment") != predecessor_digest:
+        predecessor_material_digest = self._material_digest(predecessor)
+        supplied_predecessor_digest = predecessor.get("packet_digest")
+        predecessor_digest = supplied_predecessor_digest or predecessor_material_digest
+        if packet.get("source_commitment") != predecessor_material_digest:
             return {"loaded": False, "effect_created": False, "status": "source_commitment_mismatch"}
         try:
             version = int(str(packet.get("state_version", "")).split("-")[-1])
@@ -423,6 +440,9 @@ class TransactionalExchangeStore:
                 if packet.get("source_packet_id") != head["packet_id"]:
                     conn.execute("ROLLBACK")
                     return {"loaded": False, "effect_created": False, "status": "source_not_accepted_head"}
+                if supplied_predecessor_digest and supplied_predecessor_digest != predecessor_material_digest:
+                    conn.execute("ROLLBACK")
+                    return {"loaded": False, "effect_created": False, "status": "predecessor_digest_mismatch"}
                 if predecessor_digest != head["packet_digest"]:
                     conn.execute("ROLLBACK")
                     return {"loaded": False, "effect_created": False, "status": "predecessor_content_not_accepted_head"}
