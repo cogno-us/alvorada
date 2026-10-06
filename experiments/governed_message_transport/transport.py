@@ -12,6 +12,8 @@ from typing import Any, Callable
 
 TRANSPORT_PROFILE = "urn:cognous:profiles:governed-message-transport:0.1.0"
 TRANSPORT_VERSION = "0.1.0"
+RECIPIENT_RESULT_PROFILE = "urn:cognous:profiles:governed-message-recipient-result"
+RECIPIENT_RESULT_VERSION = "1.0.0"
 CANONICALIZATION_VERSION = "json-sort-keys-compact-v1"
 ACK_KIND_DURABLE_RECEIPT = "DURABLE_RECEIPT"
 ACK_KIND_DURABLE_RECEIPT_UNRESOLVED = "DURABLE_RECEIPT_UNRESOLVED"
@@ -183,12 +185,18 @@ class RecipientOutcome:
     assessment: dict[str, Any]
     execution: dict[str, Any]
     producer_refs: dict[str, Any]
+    result_state: str = "complete"
+    artifact_export: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "result_profile": RECIPIENT_RESULT_PROFILE,
+            "result_version": RECIPIENT_RESULT_VERSION,
+            "result_state": self.result_state,
             "assessment": copy.deepcopy(self.assessment),
             "execution": copy.deepcopy(self.execution),
             "producer_refs": copy.deepcopy(self.producer_refs),
+            "artifact_export": copy.deepcopy(self.artifact_export),
         }
 
 
@@ -210,6 +218,7 @@ class AcceptedGaxRecipientAdapter:
         exchange_store_path: str | Path,
         resolver: Any,
         destination: Any,
+        execution_policy_factory: Callable[[Any], Any],
         clock_policy: DeliveryClockPolicy | None = None,
         evaluation_time: str | None = None,
     ):
@@ -226,6 +235,9 @@ class AcceptedGaxRecipientAdapter:
         self.exchange_store_path = Path(exchange_store_path)
         self.resolver = resolver
         self.destination = destination
+        if execution_policy_factory is None:
+            raise ValueError("execution_policy_factory is required")
+        self.execution_policy_factory = execution_policy_factory
         self.clock_policy = clock_policy or DeliveryClockPolicy()
         # Retained only for source compatibility with the initial transport
         # profile. It is intentionally not used for recipient evaluation.
@@ -277,21 +289,62 @@ class AcceptedGaxRecipientAdapter:
             manifest=self.manifest,
             store_path=self.exchange_store_path,
             resolver=self.resolver,
+            execution_policy_factory=self.execution_policy_factory,
         )
         execution = copy.deepcopy(result.get("execution") or {})
+        artifact_export = copy.deepcopy(result.get("artifact_export"))
+        artifact_refs = (
+            (artifact_export or {}).get("producer_refs") or {}
+            if isinstance(artifact_export, dict) else {}
+        )
         producer_refs = {
             "decision_id": execution.get("decision_id"),
             "effect_id": execution.get("effect_id"),
             "executor_attempt_id": execution.get("attempt_id"),
-            "reconstruction_bundle_id": (
-                (result.get("current_reconstruction_bundle") or {}).get("bundle_id")
-            ),
-            "successor_packet_id": (result.get("successor_packet") or {}).get("packet_id"),
+            **copy.deepcopy(artifact_refs),
         }
+        state = (
+            (artifact_export or {}).get("state")
+            if isinstance(artifact_export, dict) else "recovery_required"
+        )
         return RecipientOutcome(
             assessment=copy.deepcopy(result.get("assessment") or assessment),
             execution=execution,
             producer_refs={k: v for k, v in producer_refs.items() if v is not None},
+            result_state=state or "recovery_required",
+            artifact_export=artifact_export,
+        )
+
+    def recover(self, message: dict[str, Any], *, delivery_time: str) -> RecipientOutcome:
+        """Recover retained GAX artifacts without authorizing a replacement effect."""
+        current_time = iso(self.clock_policy.validate_now(delivery_time))
+        result = self._run_exchange(
+            copy.deepcopy(message),
+            self.bundle,
+            self.registry,
+            self.destination,
+            evaluation_time=current_time,
+            manifest=self.manifest,
+            store_path=self.exchange_store_path,
+            resolver=self.resolver,
+            execution_policy_factory=self.execution_policy_factory,
+        )
+        execution = copy.deepcopy(result.get("execution") or {})
+        artifact_export = copy.deepcopy(result.get("artifact_export"))
+        refs = copy.deepcopy((artifact_export or {}).get("producer_refs") or {})
+        refs.update({
+            k: v for k, v in {
+                "decision_id": execution.get("decision_id"),
+                "effect_id": execution.get("effect_id"),
+                "executor_attempt_id": execution.get("attempt_id"),
+            }.items() if v is not None
+        })
+        return RecipientOutcome(
+            assessment=copy.deepcopy(result.get("assessment") or {}),
+            execution=execution,
+            producer_refs=refs,
+            result_state=(artifact_export or {}).get("state", "recovery_required"),
+            artifact_export=artifact_export,
         )
 
 
@@ -328,6 +381,14 @@ class TransportStore:
                     assessment_json TEXT,
                     execution_json TEXT,
                     producer_refs_json TEXT
+                );
+                CREATE TABLE IF NOT EXISTS recipient_results (
+                    message_id TEXT PRIMARY KEY,
+                    result_profile TEXT NOT NULL,
+                    result_version TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    artifact_export_json TEXT,
+                    artifact_export_digest TEXT
                 );
                 CREATE TABLE IF NOT EXISTS attempts (
                     attempt_id TEXT PRIMARY KEY,
@@ -524,6 +585,12 @@ class TransportStore:
 
     def record_recipient_outcome(self, message_id: str, outcome: RecipientOutcome) -> None:
         payload = outcome.as_dict()
+        artifact = payload.get("artifact_export")
+        encoded_artifact = (
+            json.dumps(artifact, sort_keys=True, separators=(",", ":"))
+            if artifact is not None else None
+        )
+        artifact_digest = commitment(artifact) if artifact is not None else None
         with sqlite3.connect(self.path, isolation_level="IMMEDIATE") as con:
             con.execute(
                 """
@@ -538,16 +605,52 @@ class TransportStore:
                     message_id,
                 ),
             )
+            con.execute(
+                """
+                INSERT OR REPLACE INTO recipient_results(
+                    message_id,result_profile,result_version,state,
+                    artifact_export_json,artifact_export_digest
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    message_id, payload["result_profile"], payload["result_version"],
+                    payload["result_state"], encoded_artifact, artifact_digest,
+                ),
+            )
 
     def prior_outcome(self, message_id: str) -> RecipientOutcome | None:
         row = self.inbox_record(message_id)
         if not row or row.get("assessment_json") is None:
             return None
+        with sqlite3.connect(self.path) as con:
+            con.row_factory = sqlite3.Row
+            result = con.execute(
+                "SELECT * FROM recipient_results WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+        if result is None:
+            return RecipientOutcome(
+                assessment=json.loads(row["assessment_json"]),
+                execution=json.loads(row["execution_json"] or "{}"),
+                producer_refs=json.loads(row["producer_refs_json"] or "{}"),
+                result_state="historical_artifacts_unavailable",
+                artifact_export=None,
+            )
+        if result["result_profile"] != RECIPIENT_RESULT_PROFILE or result["result_version"] != RECIPIENT_RESULT_VERSION:
+            raise ValueError("unsupported retained recipient result profile")
+        artifact = json.loads(result["artifact_export_json"]) if result["artifact_export_json"] else None
+        if artifact is not None and result["artifact_export_digest"] != commitment(artifact):
+            raise ValueError("retained recipient artifact digest mismatch")
         return RecipientOutcome(
             assessment=json.loads(row["assessment_json"]),
             execution=json.loads(row["execution_json"] or "{}"),
             producer_refs=json.loads(row["producer_refs_json"] or "{}"),
+            result_state=result["state"],
+            artifact_export=artifact,
         )
+
+    def retained_result(self, message_id: str) -> RecipientOutcome | None:
+        return self.prior_outcome(message_id)
 
     def record_ack(self, ack: dict[str, Any]) -> None:
         with sqlite3.connect(self.path, isolation_level="IMMEDIATE") as con:
@@ -843,12 +946,31 @@ class LocalDurableTransport:
                 raise SyntheticTransportInterruption("after_recipient_processing_before_outcome_persistence")
             self.recipient_store.record_recipient_outcome(message["message_id"], outcome)
         else:
-            outcome = self.recipient_store.prior_outcome(message["message_id"])
-            if outcome is None:
+            try:
+                outcome = self.recipient_store.prior_outcome(message["message_id"])
+            except ValueError as exc:
                 return self._unresolved_receipt_ack(
-                    envelope,
-                    now=trusted_now,
-                    reason="durable_receipt_without_recipient_outcome",
+                    envelope, now=trusted_now, reason=str(exc)
+                )
+            if outcome is None or outcome.result_state in {
+                "recovery_required", "historical_artifacts_unavailable"
+            }:
+                recover = getattr(self.recipient_handler, "recover", None)
+                if recover is None:
+                    return self._unresolved_receipt_ack(
+                        envelope,
+                        now=trusted_now,
+                        reason="durable_receipt_without_recoverable_recipient_outcome",
+                    )
+                outcome = recover(copy.deepcopy(message), delivery_time=trusted_now)
+                if outcome.artifact_export is None:
+                    return self._unresolved_receipt_ack(
+                        envelope,
+                        now=trusted_now,
+                        reason="recipient_recovery_artifacts_unavailable",
+                    )
+                self.recipient_store.record_recipient_outcome(
+                    message["message_id"], outcome
                 )
 
         return self._ack(
@@ -1093,6 +1215,23 @@ class LocalDurableTransport:
             )
         if inbox and inbox.get("producer_refs_json"):
             producer_refs = json.loads(inbox["producer_refs_json"])
+        retained = None
+        try:
+            retained = self.recipient_store.retained_result(message_id)
+        except ValueError:
+            retained = None
+        artifact_summary = None
+        if retained and retained.artifact_export:
+            artifact = retained.artifact_export
+            artifact_summary = {
+                "result_profile": RECIPIENT_RESULT_PROFILE,
+                "result_version": RECIPIENT_RESULT_VERSION,
+                "state": retained.result_state,
+                "export_profile": artifact.get("export_profile"),
+                "export_version": artifact.get("export_version"),
+                "producer_refs": copy.deepcopy(artifact.get("producer_refs") or {}),
+                "artifact_commitment": commitment(artifact),
+            }
         return {
             "transport_profile": TRANSPORT_PROFILE,
             "transport_version": TRANSPORT_VERSION,
@@ -1129,6 +1268,7 @@ class LocalDurableTransport:
                 for row in recipient_acks
             ],
             "producer_refs": producer_refs,
+            "retained_artifact_summary": artifact_summary,
             "namespace_rule": (
                 "transport_attempt_id is transport-owned; decision_id, effect_id and "
                 "executor_attempt_id are linked only when returned by the recipient producer"
