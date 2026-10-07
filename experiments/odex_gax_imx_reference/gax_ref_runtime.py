@@ -37,6 +37,18 @@ GAX_ARTIFACT_EXPORT_PROFILE = "urn:cognous:profiles:gax-retained-artifacts"
 GAX_ARTIFACT_EXPORT_VERSION = "1.1.0"
 
 
+# Explicit opt-in compatibility selection; historical default remains intact.
+RUNTIME_COMPATIBILITY_PROFILE = os.environ.get("GAX_RUNTIME_COMPATIBILITY_PROFILE", "persistence-v1")
+if RUNTIME_COMPATIBILITY_PROFILE == "merged-producers-v1":
+    CP_REVISION = "d3dadee70bd319812b207389ab1e0f6efe511916"
+    MOLTBOT_REVISION = "c3c3ee7188b9367cf70b08074b9c40a5c70c94ac"
+    REPLAY_REVISION = "459e4ba62fca49364aebb0050cd5fb2dd5a71bfa"
+    ODES_REVISION = "c5e9a0f3695ae836b803be06c46d2c669642ee03"
+    EVIDENCE_PACK_REVISION = "b4baccd823d2a73be276c1de745b19cf7c56a0d6"
+elif RUNTIME_COMPATIBILITY_PROFILE != "persistence-v1":
+    raise RuntimeError("unsupported GAX runtime compatibility profile")
+
+
 def _repo_path(env_name: str, default: str) -> Path:
     return Path(os.environ.get(env_name, default)).resolve()
 

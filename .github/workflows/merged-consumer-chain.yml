@@ -1,0 +1,88 @@
+name: Merged consumer chain
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: merged-chain-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  qualify-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+        batch: [artifacts-recovery, transport-redelivery]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: cogno-us/cognous-action-manifest
+          ref: 46c950bed37fe3812000895430bc0312d29e37ce
+          path: upstream/manifest
+      - uses: actions/checkout@v4
+        with:
+          repository: cogno-us/cognous-control-plane
+          ref: d3dadee70bd319812b207389ab1e0f6efe511916
+          path: upstream/control-plane
+      - uses: actions/checkout@v4
+        with:
+          repository: cogno-us/cognous-execution-runtime
+          ref: c3c3ee7188b9367cf70b08074b9c40a5c70c94ac
+          path: upstream/moltbot-safe
+      - uses: actions/checkout@v4
+        with:
+          repository: cogno-us/cognous-replay-bundle
+          ref: 459e4ba62fca49364aebb0050cd5fb2dd5a71bfa
+          path: upstream/replay
+      - uses: actions/checkout@v4
+        with:
+          repository: cogno-us/cognous-governance-evidence-pack
+          ref: b4baccd823d2a73be276c1de745b19cf7c56a0d6
+          path: upstream/evidence-pack
+      - uses: actions/checkout@v4
+        with:
+          repository: cogno-us/open-decision-evidence-standard
+          ref: c5e9a0f3695ae836b803be06c46d2c669642ee03
+          path: upstream/odes
+      - name: Verify exact dependencies
+        run: |
+          test "$(git -C upstream/manifest rev-parse HEAD)" = "46c950bed37fe3812000895430bc0312d29e37ce"
+          test "$(git -C upstream/control-plane rev-parse HEAD)" = "d3dadee70bd319812b207389ab1e0f6efe511916"
+          test "$(git -C upstream/moltbot-safe rev-parse HEAD)" = "c3c3ee7188b9367cf70b08074b9c40a5c70c94ac"
+          test "$(git -C upstream/replay rev-parse HEAD)" = "459e4ba62fca49364aebb0050cd5fb2dd5a71bfa"
+          test "$(git -C upstream/evidence-pack rev-parse HEAD)" = "b4baccd823d2a73be276c1de745b19cf7c56a0d6"
+          test "$(git -C upstream/odes rev-parse HEAD)" = "c5e9a0f3695ae836b803be06c46d2c669642ee03"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install integration packages
+        timeout-minutes: 4
+        run: python -m pip install -e '.[dev]' -e upstream/control-plane -e upstream/replay -e upstream/evidence-pack -e upstream/odes
+      - name: Execute bounded batch
+        timeout-minutes: 3
+        env:
+          BATCH: ${{ matrix.batch }}
+          GAX_RUNTIME_COMPATIBILITY_PROFILE: merged-producers-v1
+          MOLTBOT_SAFE_CONTROL_PLANE_ROOT: upstream/control-plane
+          MOLTBOT_SAFE_ROOT: upstream/moltbot-safe
+          MOLTBOT_SAFE_MANIFEST_FIXTURE: upstream/manifest/examples/refund_integration_v1_1.manifest.json
+          UPSTREAM_MANIFEST_EXAMPLE: upstream/manifest/examples/refund_integration_v1_1.manifest.json
+          UPSTREAM_REPLAY_SUCCESS_EXAMPLE: upstream/replay/examples/bounded_success_reconstruction_v0_2.json
+          UPSTREAM_REPLAY_LOST_ACK_EXAMPLE: upstream/replay/examples/bounded_lost_ack_reconstruction_v0_2.json
+        run: |
+          mkdir -p artifacts
+          if [ "$BATCH" = artifacts-recovery ]; then
+            timeout --kill-after=10s 150s python -m pytest -q qualification tests/test_observation_repair.py tests/test_recovery_export_separation.py --junitxml=artifacts/junit.xml
+          else
+            timeout --kill-after=10s 150s python -m pytest -q tests/test_governed_message_transport.py tests/test_governed_message_transport_integration.py tests/test_gax_imx_redelivery.py tests/test_gax_imx_reference.py --junitxml=artifacts/junit.xml
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: merged-chain-${{ matrix.batch }}-py${{ matrix.python }}-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
