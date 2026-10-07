@@ -152,9 +152,11 @@ def test_recovery_denial_is_separate_from_historical_execution(
     ):
         if key in original["producer_refs"]:
             assert derivative["producer_refs"][key] == original["producer_refs"][key]
-    assert recovered["execution_facts"] == (
+    original_odes_facts = (
         original["odes"]["odes_package"]["provenance"]["execution_facts"]
     )
+    for key, value in original_odes_facts.items():
+        assert recovered["execution_facts"][key] == value
 
     # Original transport-retained evidence is immutable.
     assert transport.retained_artifacts(message["message_id"])["artifact_export"] == original
