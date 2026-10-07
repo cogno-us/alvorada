@@ -79,6 +79,12 @@ This distinction prevents the repair from falsely labelling an observed recovery
 
 The changed-authority test uses the accepted response contract: an empty observation object is absence of observation evidence. It additionally asserts zero destination queries and no Control Plane reconciliation evidence for the pre-observation branch.
 
+## Producer-reference preservation
+
+The historical-only derivative is built from a validated retained export. `_artifacts_from_retained_export` now carries the complete validated original `producer_refs` forward as `producer_identity_refs`. `_retained_artifact_export` then recomputes reconstruction, ODES, validation and successor references/commitments from the derivative contents in the normal way. Because the historical contents are unchanged, those recomputed artifact references remain equal to the original; no missing identity is synthesized.
+
+Regression assertions require complete `producer_refs` equality between original and denial derivative and explicitly verify decision ID, effect ID, attempt identity/IDs, executor producer profile and executor repository whenever those fields are present.
+
 ## CI history
 
 Initial PR head `a95d6d1d6e98add6b7734b24e90f83ad3e9c4668`, Actions run `37562096841`:
@@ -88,9 +94,14 @@ Initial PR head `a95d6d1d6e98add6b7734b24e90f83ad3e9c4668`, Actions run `3756209
 - Ten failures were a test-contract error: accepted denied responses expose empty observation `{}`, not `None`.
 - The negative-control failure was a fixture-access error: `run_once` does not return `moltbot_record` at the top level.
 
-Both test defects are corrected using the actual accepted response and retained-producer contracts.
+Corrected head `6f88aa298d6f90a96f0409244cea417d3006a162`, Actions run `37563767907`:
 
-Final-head Actions status is recorded after the final code/document commits. The repository workflow runs the complete `pytest -q tests` suite and the demonstration command with the exact accepted dependency pins.
+- complete test invocation reached **90 passed, 10 failed**;
+- all ten failures were `KeyError: effect_id` in denial-derivative `producer_refs`;
+- root cause: `_artifacts_from_retained_export` restored historical artifacts but omitted `producer_identity_refs`, so derivative construction dropped original execution identities;
+- the demonstration step did not run because the test step failed.
+
+That defect is corrected by preserving the complete validated original producer references before derivative reconstruction. Final-head Actions status is recorded after the final code/document commits. The repository workflow runs the complete `pytest -q tests` suite and, only after tests pass, the demonstration command with the exact accepted dependency pins.
 
 ## Compatibility
 
