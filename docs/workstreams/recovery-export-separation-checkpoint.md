@@ -6,84 +6,108 @@ Branch: `worker14d/recovery-export-separation`
 
 Scope: bounded repair to Alvorada GAX recovery/export semantics only. No dependency pins, Replay code, hub tests, deployment configuration, or adjacent repositories changed.
 
-## Reproduction
+## Reproduction and root cause
 
-The hub reproduction at `cogno-us/cognous-open-control-stack` PR #6, head `07c250ed4f6fae448dff3d77c7db3a5c5d056531`, identifies the smallest failing case as:
+The hub reproduction remains `cogno-us/cognous-open-control-stack` PR #6 at head `07c250ed4f6fae448dff3d77c7db3a5c5d056531`, smallest case:
 
 `tests/test_research_qualification.py::test_recovery_authority[applied-revocation]`
 
-The original effect commits with unknown acknowledgement. Current authority is then revoked. `AcceptedGaxRecipientAdapter.resume_original` correctly reaches the public executor, which denies before destination observation. At the accepted baseline, Alvorada then exports that new denied executor result together with the original retained applied destination effect. Replay rejects the combined producer record with:
+An original effect commits with unknown acknowledgement. Current authority then changes. The accepted executor correctly denies the recovery request before destination observation. At the accepted Alvorada baseline, the recovery pipeline exported that new denied executor result together with the historical applied destination effect. Replay correctly rejected the collapsed episode with:
 
 `denied execution result contradicts retained effect evidence`
 
-Replay's rejection is correct for a single execution episode. The producer export was collapsing two different episodes.
+Replay's validation remains unchanged.
 
-## Repair
+## Corrected repair
 
-`resume_original_exchange` now treats a current pre-observation denial as a separate recovery derivative:
+`resume_original_exchange` distinguishes recovery outcomes using evidence produced by the accepted executor for that call.
 
-- Historical reconstruction, ODES package, successor evidence, original decision/effect IDs, acknowledgement history, and destination-effect evidence remain unchanged.
-- The returned execution surface reports the current recovery denial.
-- The derivative lineage records:
-  - `relationship=recovery_denial_derivative`
-  - trusted recovery evaluation time
-  - scope `current_authority_revalidation_before_destination_observation`
-  - `recovery_status=denied`
-  - `destination_observation_performed=false`
-  - `replacement_dispatch_performed=false`
-  - `renewed_authorization=false`
-  - `effect_reexecution=false`
-  - commitments to the original checkpoint and retained artifact.
-- No current denied result is passed to Replay with historical effect rows.
-- Replay's denied/effect contradiction check is unchanged.
+### Denial before destination observation
 
-The export profile/version remains `urn:cognous:profiles:gax-retained-artifacts` / `1.1.0`. This is an additive state/lineage use of the existing retained-artifact envelope, not a schema or dependency contract change.
+The historical-only `recovery_denied_derivative` path is selected only when:
+
+- `result.status == "denied"`; and
+- the current result carries no `control_plane_evidence.reconciliation`.
+
+For this pre-observation denial:
+
+- historical reconstruction, ODES package, successor evidence, original decision/effect IDs, acknowledgement history and effect evidence remain unchanged;
+- the current denial is returned on the execution surface;
+- derivative lineage binds the current recovery result to its evaluation time and original artifact/checkpoint;
+- lineage retains the actual executor `error` as `recovery_reason` and the complete serialized current `recovery_result`;
+- `destination_observation_performed=false`;
+- `replacement_dispatch_performed=false`;
+- `renewed_authorization=false`;
+- `effect_reexecution=false`.
+
+No denied current execution result is passed to Replay together with historical applied effect rows.
+
+### Denial after observation/reconciliation
+
+A denied result carrying current `control_plane_evidence.reconciliation` does **not** take the historical-only path. It follows the normal producer/replay pipeline so current observation and reconciliation evidence is retained.
+
+The required prior-attempt-absence case with unchanged valid authority is covered explicitly: recovery performs one bound destination observation, produces `observed_absent`, retains `retry_eligible=false`, leaves the original effect pending/unresolved, and performs no replacement dispatch.
+
+This distinction prevents the repair from falsely labelling an observed recovery as unobserved or discarding current rejection evidence.
 
 ## Regression coverage
 
-New `tests/test_recovery_export_separation.py` covers all ten required authority/effect combinations:
+`tests/test_recovery_export_separation.py` contains:
 
-- revocation × historical applied / prior-attempt absence
-- expiry × historical applied / prior-attempt absence
-- policy-version change × historical applied / prior-attempt absence
-- stale required evidence × historical applied / prior-attempt absence
-- invalid approval × historical applied / prior-attempt absence
+1. Ten changed-authority cases:
+   - revocation
+   - expiry
+   - policy-version change
+   - stale required evidence
+   - invalid approval
 
-Each case asserts:
+   Each is exercised against historical applied effect and prior-attempt absence. These assert current denial, zero destination observation queries, no dispatch, unchanged destination/Control Plane state, original artifact immutability, preserved identities and historical acknowledgement/effect evidence.
 
-- current recovery is denied;
-- no replacement dispatch;
-- no fresh destination observation;
-- unchanged destination effect count;
-- unchanged owning Control Plane bytes;
-- original transport-retained artifact is byte-equivalent by canonical digest;
-- original decision/effect identity is preserved;
-- historical reconstruction and acknowledgement history survive;
-- applied history remains applied without becoming current permission;
-- prior-attempt absence remains pending/unresolved and no reconciliation grants retry.
+2. Valid-authority prior-attempt absence:
+   - exactly one destination observation occurs;
+   - no destination commit/replacement dispatch occurs;
+   - current reconciliation is `observed_absent`;
+   - `retry_eligible=false`;
+   - original effect remains pending and delivery unresolved;
+   - the derivative is `reconciled_derivative`;
+   - original retained transport artifacts remain unchanged.
 
-A separate malformed-producer regression changes a valid executor result to `status=denied` while retaining effect rows and asserts Replay still raises the exact contradiction error. This proves the repair does not weaken the downstream invariant or allow fabricated effect evidence on a denied execution.
+3. Replay negative control:
+   - obtains the actual accepted Moltbot producer record from `TransactionalExchangeStore.workflow_for_message` after the supported `run_once` fixture/export path;
+   - changes only the producer execution result status to `denied` while retaining real effect rows;
+   - asserts Replay still raises exactly `denied execution result contradicts retained effect evidence`.
 
-## Execution status
+The changed-authority test uses the accepted response contract: an empty observation object is absence of observation evidence. It additionally asserts zero destination queries and no Control Plane reconciliation evidence for the pre-observation branch.
 
-Local container execution was not available because this environment cannot resolve GitHub for cloning the pinned dependency repositories. Repository writes and review were performed through the connected GitHub interface. GitHub Actions on the branch/PR is therefore the executable source of truth. Final-head CI must be checked once and recorded in the PR handoff.
+## CI history
+
+Initial PR head `a95d6d1d6e98add6b7734b24e90f83ad3e9c4668`, Actions run `37562096841`:
+
+- Python 3.11: **11 failed, 88 passed**.
+- Python 3.12 job was cancelled after the matrix failure.
+- Ten failures were a test-contract error: accepted denied responses expose empty observation `{}`, not `None`.
+- The negative-control failure was a fixture-access error: `run_once` does not return `moltbot_record` at the top level.
+
+Both test defects are corrected using the actual accepted response and retained-producer contracts.
+
+Final-head Actions status is recorded after the final code/document commits. The repository workflow runs the complete `pytest -q tests` suite and the demonstration command with the exact accepted dependency pins.
 
 ## Compatibility
 
-Expected compatible consumers:
-
-- Replay `274543f1cd7171784a923a8e37015017a0d8bc9d`: unchanged contract and unchanged contradiction guard.
+- GAX retained artifact profile/version remains `urn:cognous:profiles:gax-retained-artifacts` / `1.1.0`.
+- Replay `274543f1cd7171784a923a8e37015017a0d8bc9d`: unchanged.
 - Moltbot Safe `177354e959cc78c59c1a776f018cfbfbf28c927b`: unchanged producer profile 2.0.0.
-- Control Plane `2ea9528eeb87e14ff10f05de06473122b9df540f`: unchanged public execution/revalidation behavior.
-- ODES `226adb0e3cde5377ac9db6f7e5857bfa7e65e30a` and Evidence Pack `812194b9a89a5fa21e675200fcb4e0089666f1b6`: historical evidence remains the same retained reconstruction.
+- Control Plane `2ea9528eeb87e14ff10f05de06473122b9df540f`: unchanged.
+- ODES `226adb0e3cde5377ac9db6f7e5857bfa7e65e30a`: unchanged.
+- Evidence Pack `812194b9a89a5fa21e675200fcb4e0089666f1b6`: unchanged.
 
-Consumers that enumerate artifact `state` values exhaustively must accept `recovery_denied_derivative`. The export version does not change because state is already an open producer-level discriminator in the existing envelope; no existing field changes meaning.
+Consumers that exhaustively enumerate retained-artifact `state` values must tolerate `recovery_denied_derivative`. Existing fields do not change meaning.
 
 ## Deliberately unchanged
 
-- Hub PR #6 and its failing tests.
+- Hub PR #6 and its tests.
 - Replay validation logic.
-- Authority rules and decision reasons.
+- Authority rules and denial reasons.
 - Destination observation APIs.
 - Retry authorization semantics.
 - Original retained artifacts and transport receipts.
