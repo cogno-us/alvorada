@@ -106,7 +106,11 @@ The immediately preceding Control Plane/Replay pair
 `274543f1cd7171784a923a8e37015017a0d8bc9d` remains historical compatibility
 evidence and is not relabeled.
 
-End-to-end qualification remains conditional on accepted ODES and Evidence Pack
-consumer mappings for the new Control Plane/Replay pair. Until those merges are
-accepted, this branch is preparation plus stage-level qualification, not an
-end-to-end readiness claim.
+Phase B selects accepted persistence-compatible consumers:
+`cogno-us/open-decision-evidence-standard@0486b645e99c46d9cd16ca34b1ba7c653a6b3024`
+and
+`cogno-us/cognous-agent-governance-evidence-pack@de6b9e071df49fc3e0c1254d39b5c94cced554f0`.
+Earlier ODES/Evidence Pack revisions remain historical qualification mappings
+and are not relabeled. Full-path qualification results are recorded in the
+workstream checkpoint; dependency selection alone is not an end-to-end
+readiness claim.
