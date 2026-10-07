@@ -57,14 +57,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: cogno-us/cognous-agent-governance-evidence-pack
-          ref: 812194b9a89a5fa21e675200fcb4e0089666f1b6
+          ref: de6b9e071df49fc3e0c1254d39b5c94cced554f0
           path: upstream/evidence-pack
 
       - name: Checkout pinned ODES
         uses: actions/checkout@v4
         with:
           repository: cogno-us/open-decision-evidence-standard
-          ref: 226adb0e3cde5377ac9db6f7e5857bfa7e65e30a
+          ref: 0486b645e99c46d9cd16ca34b1ba7c653a6b3024
           path: upstream/odes
 
       - name: Verify pinned revisions
@@ -74,8 +74,8 @@ jobs:
           test "$(git -C upstream/control-plane rev-parse HEAD)" = "248d899634d9db3518e831bc7ab568a48733f825"
           test "$(git -C upstream/moltbot-safe rev-parse HEAD)" = "177354e959cc78c59c1a776f018cfbfbf28c927b"
           test "$(git -C upstream/replay rev-parse HEAD)" = "043830b56595cecddfa65c064afd1c0b95e64792"
-          test "$(git -C upstream/evidence-pack rev-parse HEAD)" = "812194b9a89a5fa21e675200fcb4e0089666f1b6"
-          test "$(git -C upstream/odes rev-parse HEAD)" = "226adb0e3cde5377ac9db6f7e5857bfa7e65e30a"
+          test "$(git -C upstream/evidence-pack rev-parse HEAD)" = "de6b9e071df49fc3e0c1254d39b5c94cced554f0"
+          test "$(git -C upstream/odes rev-parse HEAD)" = "0486b645e99c46d9cd16ca34b1ba7c653a6b3024"
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
