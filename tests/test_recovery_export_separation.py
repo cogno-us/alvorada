@@ -141,6 +141,17 @@ def test_recovery_denial_is_separate_from_historical_execution(
     assert derivative["reconstruction_bundle"] == original["reconstruction_bundle"]
     assert derivative["producer_refs"]["reconstruction_digest"] == original_reconstruction_digest
     assert derivative["producer_refs"]["effect_id"] == effect_id
+    assert derivative["producer_refs"]["decision_id"] == original["producer_refs"]["decision_id"]
+    assert derivative["producer_refs"] == original["producer_refs"]
+    for key in (
+        "attempt_identity",
+        "executor_attempt_ids",
+        "control_plane_attempt_ids",
+        "executor_producer_profile",
+        "executor_repository",
+    ):
+        if key in original["producer_refs"]:
+            assert derivative["producer_refs"][key] == original["producer_refs"][key]
     assert recovered["execution_facts"] == (
         original["odes"]["odes_package"]["provenance"]["execution_facts"]
     )
