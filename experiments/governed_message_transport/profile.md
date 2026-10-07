@@ -8,7 +8,7 @@ Profile identifier: `urn:cognous:profiles:governed-message-transport:0.1.0`
 
 This package adds a bounded durable delivery interface around an already-governed message. It deliberately does not redefine ODEX-GAX/IMX message semantics, institutional authority, Control Plane authorization, constrained execution, Replay reconstruction, ODES decision evidence, or independent verification.
 
-The accepted GAX/IMX source baseline is `cogno-us/alvorada@9ad378145d326799e3209136e47e82d66c6f69af`. The open follow-up PR #2 is not a dependency.
+The accepted GAX/IMX source baseline is `cogno-us/cognous-governed-exchange@9ad378145d326799e3209136e47e82d66c6f69af`. The open follow-up PR #2 is not a dependency.
 
 ## Transport envelope
 
