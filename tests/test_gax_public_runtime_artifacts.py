@@ -562,9 +562,15 @@ def test_retained_replay_passes_evidence_pack_and_odes_integrity_without_assuran
     rendered = render_traceable_markdown(pack)
     trace = pack.metadata["traceable_import"]
 
-    assert trace["supported_revisions"]["replay"] == "274543f1cd7171784a923a8e37015017a0d8bc9d"
+    assert trace["selected_revisions"]["replay"] == "043830b56595cecddfa65c064afd1c0b95e64792"
+    assert trace["selected_revisions"]["control_plane"] == "248d899634d9db3518e831bc7ab568a48733f825"
+    assert trace["supported_revisions"]["replay"] == "043830b56595cecddfa65c064afd1c0b95e64792"
+    assert trace["supported_revisions"]["control_plane"] == "248d899634d9db3518e831bc7ab568a48733f825"
     assert trace["supported_revisions"]["moltbot_safe"] == "177354e959cc78c59c1a776f018cfbfbf28c927b"
-    assert trace["supported_revisions"]["odes"] == "226adb0e3cde5377ac9db6f7e5857bfa7e65e30a"
+    assert "274543f1cd7171784a923a8e37015017a0d8bc9d" in trace["supported_revision_sets"]["replay"]
+    assert "043830b56595cecddfa65c064afd1c0b95e64792" in trace["supported_revision_sets"]["replay"]
+    assert "2ea9528eeb87e14ff10f05de06473122b9df540f" in trace["supported_revision_sets"]["control_plane"]
+    assert "248d899634d9db3518e831bc7ab568a48733f825" in trace["supported_revision_sets"]["control_plane"]
     assert trace["lifecycle_summary"]["independent_verification"] == "unavailable"
     assert trace["lifecycle_summary"]["current_permission"] == "not_evaluated_from_historical_records"
     assert "does not authenticate the producer" in rendered
