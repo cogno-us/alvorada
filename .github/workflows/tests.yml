@@ -96,6 +96,9 @@ jobs:
           import agent_governance_evidence_pack
           PY
 
+      - name: Run focused Control Plane persistence adoption checks
+        run: pytest -q tests/test_control_plane_store_adoption.py
+
       - name: Run tests
         env:
           GAX_QUALIFICATION_RESULTS: /tmp/gax-observation-repair-results.json
