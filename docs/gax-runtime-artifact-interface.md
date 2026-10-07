@@ -83,3 +83,30 @@ The original `recover` path remains evidence-only: when originals were never pro
 Completeness and delivery are separate. An acknowledged real effect can have null validated observation and unresolved delivery. Accepted later applied evidence resolves delivery while retaining earlier rejection. Lost acknowledgement remains unknown in its original record even with applied observation; new reconciliation acknowledgements are separate and produce a mixed history. `observed_absent` does not confer retry permission. Control Plane and executor attempts retain their own namespaces.
 
 Successor decision attribution remains null where the producer supplies none. No attribution is invented. Pending/unresolved state follows validated destination evidence, not reconstruction completeness or receipt labels. ODES recipient inspection remains unauthenticated with current authority unavailable under the reference policy.
+
+
+## Control Plane persistence-adoption candidate
+
+This branch selects the accepted same-host persistence repair
+`cogno-us/cognous-agent-control-plane@248d899634d9db3518e831bc7ab568a48733f825`
+and its accepted Replay compatibility
+`cogno-us/cognous-agent-replay-bundle@043830b56595cecddfa65c064afd1c0b95e64792`.
+The executor remains
+`cogno-us/moltbot-safe@177354e959cc78c59c1a776f018cfbfbf28c927b`
+with producer profile 2.0.0.
+
+This is a dependency-generation change, not a retained-artifact wire/profile
+change. GAX retained-artifact export remains 1.1.0. The repaired Control Plane
+changes persistence mechanics for individual record transactions while keeping
+the consumed `BoundedRunRecord` contract. Replay records the actual selected
+Control Plane revision in its producer profile and metadata.
+
+The immediately preceding Control Plane/Replay pair
+`2ea9528eeb87e14ff10f05de06473122b9df540f` /
+`274543f1cd7171784a923a8e37015017a0d8bc9d` remains historical compatibility
+evidence and is not relabeled.
+
+End-to-end qualification remains conditional on accepted ODES and Evidence Pack
+consumer mappings for the new Control Plane/Replay pair. Until those merges are
+accepted, this branch is preparation plus stage-level qualification, not an
+end-to-end readiness claim.
