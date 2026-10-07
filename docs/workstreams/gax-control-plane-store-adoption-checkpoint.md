@@ -109,8 +109,86 @@ made optional, or bypassed.
 
 ## Validation record
 
-Focused checks are run before the full suite in CI. Final commands/results and
-any exact consumer rejection are recorded here after the branch head executes.
+CI run `37581905307` executed exact pinned checkouts for the Phase A branch.
+
+### Focused stage-level checks
+
+Command:
+
+```sh
+pytest -q tests/test_control_plane_store_adoption.py
+```
+
+Results:
+
+- Python 3.11: **passed**.
+- Python 3.12: **passed**.
+
+These results establish only the repaired local Control Plane store/restart
+behavior and Replay revision selection/source attribution described above.
+
+### Full suite / consumer-boundary reproduction
+
+Command:
+
+```sh
+pytest -q tests
+```
+
+Python 3.12 reached **44 passed, 60 failed**. The failures converge on the
+accepted ODES consumer at
+`upstream/odes/src/odes/exporter.py::_run_replay_validation`, which reads
+`bundle.metadata.control_plane_revision` and rejects
+`248d899634d9db3518e831bc7ab568a48733f825` because accepted ODES
+`226adb0e3cde5377ac9db6f7e5857bfa7e65e30a` permits only its historical and
+previous producer-v2 Control Plane revisions. The exact error is:
+
+```text
+odes.exporter.ExportError: unsupported Control Plane compatibility revision
+```
+
+This is the required non-bypassed smallest integration blocker. The failures
+occur after Replay has truthfully emitted the selected Control Plane revision
+and before ODES export/recipient validation can complete.
+
+Python 3.11 completed the focused checks successfully; its full-suite step was
+cancelled after the matrix failure. The demonstration command was skipped
+because the full test gate failed. Evidence Pack persistence-revision
+qualification was therefore not reached through the complete public path; it is
+still independently blocked by its accepted `V2_REVISIONS` mapping, which
+declares Control Plane `2ea9528e...` and Replay `274543f1...`.
+
+No validation was weakened, mocked or marked optional. No ODES or Evidence Pack
+code was changed.
+
+### Qualification state
+
+Completed now:
+
+- repaired store construction on supported CI local filesystem;
+- record persistence across a fresh store instance;
+- decision/effect/Control Plane attempt identity persistence;
+- Replay acceptance of `248d8996...`;
+- Replay metadata and producer attribution of the actual selected revision;
+- unsupported Control Plane revision rejection;
+- preservation of public executor imports and explicit resolver/policy/time
+  inputs.
+
+Blocked pending accepted consumer merges:
+
+- complete Transport → GAX → Control Plane → executor → Replay → ODES →
+  successor qualification;
+- retained Replay → Evidence Pack import/validate/render under the new revision
+  mapping;
+- therefore the requested full scenario matrix under the new dependency
+  generation.
+
+Existing accepted baseline tests continue to define the required semantic
+assertions for no replacement dispatch, pending original effect after prior
+absence, `retry_eligible=false`, recovery denial separation, reconciliation,
+historical artifact immutability and contradictory-lineage rejection. They are
+not claimed requalified under the new generation until the consumer gate is
+accepted.
 
 ## Phase B gate
 
