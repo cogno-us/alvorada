@@ -1,4 +1,4 @@
-# Alvorada Experimental Workbench — One-Page Overview
+# Cognous Governed Exchange — One-Page Overview
 
 ## Purpose
 

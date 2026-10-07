@@ -1,4 +1,4 @@
-# Alvorada Experimental Workbench — Business Collateral
+# Cognous Governed Exchange — Business Collateral
 
 ## 1. Executive Summary
 
