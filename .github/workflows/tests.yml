@@ -97,7 +97,13 @@ jobs:
           PY
 
       - name: Run focused Control Plane persistence adoption checks
-        run: pytest -q tests/test_control_plane_store_adoption.py
+        env:
+          UPSTREAM_MANIFEST_EXAMPLE: upstream/manifest/examples/refund_integration_v1_1.manifest.json
+          UPSTREAM_REPLAY_SUCCESS_EXAMPLE: upstream/replay/examples/bounded_success_reconstruction_v0_2.json
+          UPSTREAM_REPLAY_LOST_ACK_EXAMPLE: upstream/replay/examples/bounded_lost_ack_reconstruction_v0_2.json
+        run: |
+          pytest -q tests/test_control_plane_store_adoption.py
+          pytest -q tests/test_gax_public_runtime_artifacts.py tests/test_observation_repair.py tests/test_recovery_export_separation.py
 
       - name: Run tests
         env:
