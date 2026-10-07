@@ -19,3 +19,11 @@
 - Added stage-level same-host store/restart and Replay revision-attribution checks.
 - Kept ODES/Evidence Pack consumer pins unchanged pending accepted persistence-compatibility merges.
 - Preserved retained-artifact version 1.1.0 and historical dependency mappings without relabeling.
+
+
+## Control Plane persistence adoption Phase B
+
+- Advanced current ODES selection to `0486b645e99c46d9cd16ca34b1ba7c653a6b3024`.
+- Advanced current Evidence Pack selection to `de6b9e071df49fc3e0c1254d39b5c94cced554f0`.
+- Preserved earlier ODES/Evidence Pack revisions as historical qualification combinations.
+- Added focused public-path qualification before the complete CI suite.
