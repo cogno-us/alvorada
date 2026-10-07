@@ -1,6 +1,6 @@
 # GAX Control Plane store adoption checkpoint
 
-Status: **Phase A preparation in progress; full consumer qualification not yet accepted.**
+Status: **Phase B complete on accepted persistence-compatible consumers; Governor review pending.**
 
 ## Scope and baseline
 
@@ -24,8 +24,8 @@ dependency revision update does not change its wire semantics.
 | Runtime Control Plane | `cogno-us/cognous-agent-control-plane` | `248d899634d9db3518e831bc7ab568a48733f825` | accepted same-host record persistence repair |
 | Executor producer | `cogno-us/moltbot-safe` | `177354e959cc78c59c1a776f018cfbfbf28c927b` | accepted executor producer profile 2.0.0 |
 | Replay decoder | `cogno-us/cognous-agent-replay-bundle` | `043830b56595cecddfa65c064afd1c0b95e64792` | accepted compatibility for Control Plane persistence revision |
-| ODES consumer | `cogno-us/open-decision-evidence-standard` | `226adb0e3cde5377ac9db6f7e5857bfa7e65e30a` | accepted producer-v2 consumer; does **not** yet declare CP `248d8996...` / Replay `043830b5...` |
-| Evidence Pack consumer | `cogno-us/cognous-agent-governance-evidence-pack` | `812194b9a89a5fa21e675200fcb4e0089666f1b6` | accepted producer-v2 consumer; does **not** yet declare CP `248d8996...` / Replay `043830b5...` |
+| ODES consumer | `cogno-us/open-decision-evidence-standard` | `0486b645e99c46d9cd16ca34b1ba7c653a6b3024` | accepted persistence-compatible ODES mapping |
+| Evidence Pack consumer | `cogno-us/cognous-agent-governance-evidence-pack` | `de6b9e071df49fc3e0c1254d39b5c94cced554f0` | accepted persistence-compatible retained-Replay mapping |
 | Manifest | `cogno-us/cognous-agent-action-manifest` | `46c950bed37fe3812000895430bc0312d29e37ce` | unchanged |
 | Authority Context | `cogno-us/constitutional-governance-for-institutions` | `fb3d97938969a89e149e8ff8db2756091d1233fc` | unchanged |
 
@@ -190,8 +190,72 @@ historical artifact immutability and contradictory-lineage rejection. They are
 not claimed requalified under the new generation until the consumer gate is
 accepted.
 
-## Phase B gate
+## Phase B qualification
 
-Phase B is blocked until accepted ODES and Evidence Pack merge revisions are
-available and verified to contain their reviewed persistence-compatibility
-changes. This branch does not poll for or consume those pending branches.
+Accepted consumer merges were verified before selection:
+
+- ODES: `0486b645e99c46d9cd16ca34b1ba7c653a6b3024`
+- Evidence Pack: `de6b9e071df49fc3e0c1254d39b5c94cced554f0`
+
+Only those current dependency selections and their CI/documentation references
+were advanced. Earlier ODES `226adb0e...` and Evidence Pack `812194b9...`
+remain historical qualification mappings and are not relabelled.
+
+The focused Phase B gate executes:
+
+```sh
+pytest -q tests/test_control_plane_store_adoption.py
+pytest -q tests/test_gax_public_runtime_artifacts.py tests/test_observation_repair.py tests/test_recovery_export_separation.py
+```
+
+At code head `201b8e1f7b43e6482a0bc57b2b466c5c6648de5e`, Actions run
+`37613785684` produced:
+
+- Python 3.11: **4 passed** stage-level adoption checks; **36 passed** focused
+  public-path/recovery checks; **104 passed** complete suite; demo **passed**.
+- Python 3.12: **4 passed** stage-level adoption checks; **36 passed** focused
+  public-path/recovery checks; **104 passed** complete suite; demo **passed**.
+- exact pin verification: **passed** on both jobs.
+
+The complete suite therefore exercises the accepted public path:
+
+`Transport -> GAX assessment -> Control Plane -> actual executor -> Replay -> ODES -> successor`
+
+and retained Replay through Evidence Pack import/validate/traceable render.
+
+The exercised regressions preserve:
+
+- one bound destination effect for authorized success;
+- duplicate/redelivery returning retained original artifacts without a second effect;
+- lost acknowledgement and restart under original decision/effect identities;
+- derivative-only post-effect evidence recovery with no replacement dispatch;
+- prior-attempt absence as pending/unresolved with `retry_eligible=false`;
+- unresolved partial delivery;
+- changed-authority pre-observation recovery denial as
+  `recovery_denied_derivative`, separate from historical authorized execution;
+- denied recovery carrying reconciliation through the normal reconciliation
+  derivative so current observation evidence is retained;
+- distinct Control Plane and executor attempt namespaces;
+- fail-closed contradictory attribution, operation binding and retained-artifact
+  tampering;
+- evidence-only import/export/redelivery without destination or Control Plane
+  mutation;
+- ODES content integrity without upgrading it to producer authentication or
+  current institutional authority.
+
+A Phase B test-only correction changed the Evidence Pack assertion from the
+previous selected Replay revision to the accepted persistence generation and
+asserts both old and new revisions in `supported_revision_sets`. Historical
+mappings were not rewritten.
+
+## Remaining boundary
+
+No component blocker remains in this bounded workstream. Governor review/merge
+is still required.
+
+The repaired Control Plane protects individual same-host record transactions.
+This qualification does **not** establish atomicity across the transport store,
+GAX exchange store, Control Plane record store and destination. It also does not
+establish distributed delivery guarantees, remote finality, independent
+real-world effect verification, production authentication, or business-intent
+deduplication.
