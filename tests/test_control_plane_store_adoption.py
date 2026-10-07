@@ -6,7 +6,9 @@ import pytest
 
 from experiments.odex_gax_imx_reference.gax_ref_runtime import (
     CP_REVISION,
-    MOLTBOT_PRODUCER_PROFILE_VERSION,\n    ODES_REVISION,\n    EVIDENCE_PACK_REVISION,
+    MOLTBOT_PRODUCER_PROFILE_VERSION,
+    ODES_REVISION,
+    EVIDENCE_PACK_REVISION,
     MOLTBOT_REVISION,
     REPLAY_REVISION,
     load_executor_runtime,
@@ -15,7 +17,9 @@ from experiments.odex_gax_imx_reference.gax_ref_runtime import (
 
 ACCEPTED_CONTROL_PLANE_PERSISTENCE = "248d899634d9db3518e831bc7ab568a48733f825"
 ACCEPTED_REPLAY_COMPATIBILITY = "043830b56595cecddfa65c064afd1c0b95e64792"
-ACCEPTED_EXECUTOR = "177354e959cc78c59c1a776f018cfbfbf28c927b"\nACCEPTED_ODES = "0486b645e99c46d9cd16ca34b1ba7c653a6b3024"\nACCEPTED_EVIDENCE_PACK = "de6b9e071df49fc3e0c1254d39b5c94cced554f0"
+ACCEPTED_EXECUTOR = "177354e959cc78c59c1a776f018cfbfbf28c927b"
+ACCEPTED_ODES = "0486b645e99c46d9cd16ca34b1ba7c653a6b3024"
+ACCEPTED_EVIDENCE_PACK = "de6b9e071df49fc3e0c1254d39b5c94cced554f0"
 
 
 def test_stage_level_selected_runtime_revisions_are_exact():
@@ -23,7 +27,9 @@ def test_stage_level_selected_runtime_revisions_are_exact():
     assert CP_REVISION == ACCEPTED_CONTROL_PLANE_PERSISTENCE
     assert REPLAY_REVISION == ACCEPTED_REPLAY_COMPATIBILITY
     assert MOLTBOT_REVISION == ACCEPTED_EXECUTOR
-    assert MOLTBOT_PRODUCER_PROFILE_VERSION == "2.0.0"\n    assert ODES_REVISION == ACCEPTED_ODES\n    assert EVIDENCE_PACK_REVISION == ACCEPTED_EVIDENCE_PACK
+    assert MOLTBOT_PRODUCER_PROFILE_VERSION == "2.0.0"
+    assert ODES_REVISION == ACCEPTED_ODES
+    assert EVIDENCE_PACK_REVISION == ACCEPTED_EVIDENCE_PACK
 
 
 def test_stage_level_repaired_store_constructs_and_persists_across_restart(tmp_path: Path):
