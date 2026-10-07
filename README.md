@@ -114,3 +114,7 @@ Component links are navigation, not a requirement to install every component. Th
 ## Repository locations
 
 See the [repository rename map and compatibility notes](https://github.com/cogno-us/cognous-open-control-stack/blob/main/docs/repository-renames.md) for current component URLs. Existing package names, schema identifiers and retained producer identities are unchanged.
+
+## Merged producer and consumer compatibility
+
+An explicit `merged-producers-v1` profile selects the accepted newer Control Plane, execution runtime, Replay, Evidence Pack and ODES revisions. The historical profile remains the default. See [exact revisions, qualification and limits](docs/merged-consumer-chain.md). This profile does not enable atomic-claim or refund-intent execution.
