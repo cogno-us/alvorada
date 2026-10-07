@@ -103,6 +103,20 @@ Corrected head `6f88aa298d6f90a96f0409244cea417d3006a162`, Actions run `37563767
 
 That defect is corrected by preserving the complete validated original producer references before derivative reconstruction. Final-head Actions status is recorded after the final code/document commits. The repository workflow runs the complete `pytest -q tests` suite and, only after tests pass, the demonstration command with the exact accepted dependency pins.
 
+Corrected head `fcbe87f014e0d5c35cdaaaec99a65c21aa49e531`, Actions run `37564274653`:
+
+- complete test invocation reached **90 passed, 10 failed**;
+- producer-reference preservation assertions passed;
+- all ten remaining failures were test-only comparisons between GAX `execution_facts` and raw ODES provenance facts;
+- GAX intentionally derives `pending_effects` and `unresolved_delivery` in addition to the raw ODES fields;
+- the demonstration step did not run because the test step failed.
+
+The bounded test correction now compares every original ODES execution-fact field exactly and asserts the two GAX-derived fields separately:
+- applied history: `pending_effects=[]`, `unresolved_delivery=false`;
+- prior-attempt absence: `pending_effects=[original effect_id]`, `unresolved_delivery=true`.
+
+No runtime code changed for this correction. Original Replay/ODES/successor artifact equality, complete producer-reference equality, observation-aware branch selection, historical artifact immutability and Replay negative control remain intact.
+
 ## Compatibility
 
 - GAX retained artifact profile/version remains `urn:cognous:profiles:gax-retained-artifacts` / `1.1.0`.
