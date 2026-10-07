@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from experiments.odex_gax_imx_reference.synthetic_fixture import synthetic_observation_policy, synthetic_observation_clock
+
 import copy
 import json
 import os
@@ -83,6 +85,8 @@ def test_run_exchange_success_uses_assessed_request_supplied_resolver_destinatio
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     assert result["execution"]["attempt_status"] == "executed"
     assert result["execution"]["newly_executed"] is True
@@ -133,6 +137,8 @@ def test_run_exchange_altered_actor_principal_or_scope_cannot_acquire_authority(
         store_path=tmp_path / mutation / "exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     assert result["execution"]["attempted"] is False
     assert result["assessment"]["stages"]["authority"] in {"hold", "denied"}
@@ -157,6 +163,8 @@ def test_run_exchange_revocation_after_decision_prevents_execution(tmp_path):
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         mutate_resolver_after_decision=revoke,
     )
     assert result["execution"]["attempt_status"] == "denied"
@@ -177,10 +185,13 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         lose_ack=True,
     )
     assert first["execution"]["attempt_status"] == "unknown"
-    assert first["successor_packet"]["unresolved_delivery"] is True
+    assert first["successor_packet"]["unresolved_delivery"] is False
+    assert first["execution"]["acknowledged"] is False
     assert len(_effect_rows(destination)) == 1
 
     runtime = load_executor_runtime()
@@ -196,6 +207,8 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver2,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     assert second["execution"]["attempt_status"] == "reconciled"
     assert second["execution"]["newly_executed"] is False
@@ -212,6 +225,8 @@ def test_run_exchange_uses_supplied_destination_state_restart_and_redelivery(tmp
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver3,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     assert exact_redelivery["execution"]["attempt_status"] == "reconciled"
     assert len(_effect_rows(restarted_destination)) == 1
@@ -229,6 +244,8 @@ def test_run_exchange_partial_delivery_successor_reports_pending_unresolved_effe
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         partial_delivery=True,
     )
     assert result["execution"]["attempt_status"] == "partial"

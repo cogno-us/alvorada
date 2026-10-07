@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from experiments.odex_gax_imx_reference.synthetic_fixture import synthetic_observation_policy, synthetic_observation_clock
+
 import json
 import os
 import sqlite3
@@ -75,6 +77,8 @@ def test_transport_to_accepted_gax_assessment_lost_ack_restart_no_second_effect(
         exchange_store_path=tmp_path / "gax-exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         destination=destination,
     )
     ids = iter(["transport-attempt-1", "transport-attempt-2"])
@@ -144,6 +148,8 @@ def _accepted_fixture(tmp_path: Path):
         exchange_store_path=tmp_path / "gax-exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         destination=destination,
     )
     return bundle, handler, destination

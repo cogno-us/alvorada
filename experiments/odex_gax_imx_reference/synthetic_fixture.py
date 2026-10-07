@@ -25,3 +25,14 @@ def synthetic_refund_policy(operation: Any):
         max_amount=1000.0,
         max_effects=1,
     )
+
+
+def synthetic_observation_policy():
+    """Explicit local observation policy for bounded demos/tests only."""
+    from agent_control_plane.bounded import ObservationPolicy
+    return ObservationPolicy(max_age_seconds=60)
+
+
+def synthetic_observation_clock():
+    from .gax_ref import EVAL, parse_time
+    return parse_time(EVAL)

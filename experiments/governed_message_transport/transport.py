@@ -219,6 +219,8 @@ class AcceptedGaxRecipientAdapter:
         resolver: Any,
         destination: Any,
         execution_policy_factory: Callable[[Any], Any],
+        observation_policy: Any = None,
+        observation_clock: Callable | None = None,
         clock_policy: DeliveryClockPolicy | None = None,
         evaluation_time: str | None = None,
     ):
@@ -237,6 +239,10 @@ class AcceptedGaxRecipientAdapter:
         self.destination = destination
         if execution_policy_factory is None:
             raise ValueError("execution_policy_factory is required")
+        if observation_policy is None:
+            raise ValueError("observation_policy is required")
+        self.observation_policy = observation_policy
+        self.observation_clock = observation_clock
         self.execution_policy_factory = execution_policy_factory
         self.clock_policy = clock_policy or DeliveryClockPolicy()
         # Retained only for source compatibility with the initial transport
@@ -290,6 +296,8 @@ class AcceptedGaxRecipientAdapter:
             store_path=self.exchange_store_path,
             resolver=self.resolver,
             execution_policy_factory=self.execution_policy_factory,
+            observation_policy=self.observation_policy,
+            observation_clock=self.observation_clock,
         )
         execution = copy.deepcopy(result.get("execution") or {})
         artifact_export = copy.deepcopy(result.get("artifact_export"))
@@ -315,6 +323,15 @@ class AcceptedGaxRecipientAdapter:
             artifact_export=artifact_export,
         )
 
+    def resume_original(self, message: dict[str, Any], *, delivery_time: str) -> dict[str, Any]:
+        """Explicit original-effect observation recovery, separate from redelivery."""
+        from experiments.odex_gax_imx_reference.gax_ref_runtime import resume_original_exchange
+        return resume_original_exchange(copy.deepcopy(message), manifest=self.manifest,
+            store_path=self.exchange_store_path, destination=self.destination,
+            resolver=self.resolver, execution_policy_factory=self.execution_policy_factory,
+            observation_policy=self.observation_policy, observation_clock=self.observation_clock,
+            evaluation_time=iso(self.clock_policy.validate_now(delivery_time)))
+
     def recover(self, message: dict[str, Any], *, delivery_time: str) -> RecipientOutcome:
         """Recover retained GAX artifacts without authorizing a replacement effect."""
         current_time = iso(self.clock_policy.validate_now(delivery_time))
@@ -328,6 +345,8 @@ class AcceptedGaxRecipientAdapter:
             store_path=self.exchange_store_path,
             resolver=self.resolver,
             execution_policy_factory=self.execution_policy_factory,
+            observation_policy=self.observation_policy,
+            observation_clock=self.observation_clock,
         )
         execution = copy.deepcopy(result.get("execution") or {})
         artifact_export = copy.deepcopy(result.get("artifact_export"))

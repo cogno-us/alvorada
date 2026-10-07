@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from experiments.odex_gax_imx_reference.synthetic_fixture import synthetic_observation_policy, synthetic_observation_clock
+
 import functools
 import json
 import subprocess
@@ -64,6 +66,8 @@ def run_once(tmp_path: Path, message_id: str, **kwargs):
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         **kwargs,
     )
     return manifest, bundle, resolver, destination, registry, message, result
@@ -91,6 +95,8 @@ def test_normal_and_duplicate_return_same_retained_original_artifacts(tmp_path):
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     assert second["artifact_export"] == original
     assert second["current_reconstruction_bundle"]["bundle_id"] == original["producer_refs"]["reconstruction_bundle_id"]
@@ -114,6 +120,8 @@ def test_evidence_export_failure_recovers_distinct_derivative_without_effect(tmp
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     export = recovered["artifact_export"]
     assert export["state"] == "regenerated_derivative"
@@ -167,6 +175,8 @@ def test_transport_persists_full_original_export_and_returns_it_on_redelivery(tm
         resolver=resolver,
         destination=destination,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     transport = LocalDurableTransport(
         sender_store_path=tmp_path / "sender.sqlite",
@@ -221,6 +231,8 @@ def _accepted_transport(tmp_path: Path, message_id: str, *, exchange_options=Non
         resolver=resolver,
         destination=destination,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     if exchange_options:
         handler._run_exchange = functools.partial(
@@ -363,6 +375,8 @@ def test_transport_denied_outcome_retains_evidence_without_effect(tmp_path):
         resolver=resolver,
         destination=destination,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     transport = LocalDurableTransport(
         sender_store_path=tmp_path / "sender.sqlite",
@@ -548,9 +562,9 @@ def test_retained_replay_passes_evidence_pack_and_odes_integrity_without_assuran
     rendered = render_traceable_markdown(pack)
     trace = pack.metadata["traceable_import"]
 
-    assert trace["supported_revisions"]["replay"] == "f63ce914504dd06813c4ccd199b0570dbd8dd427"
-    assert trace["supported_revisions"]["moltbot_safe"] == "1d308faf664c504b6e310db3c7a310153ef7b067"
-    assert trace["supported_revisions"]["odes"] == "cba83a1c06f718a8afd76178f36e5cc15896347d"
+    assert trace["supported_revisions"]["replay"] == "274543f1cd7171784a923a8e37015017a0d8bc9d"
+    assert trace["supported_revisions"]["moltbot_safe"] == "177354e959cc78c59c1a776f018cfbfbf28c927b"
+    assert trace["supported_revisions"]["odes"] == "226adb0e3cde5377ac9db6f7e5857bfa7e65e30a"
     assert trace["lifecycle_summary"]["independent_verification"] == "unavailable"
     assert trace["lifecycle_summary"]["current_permission"] == "not_evaluated_from_historical_records"
     assert "does not authenticate the producer" in rendered

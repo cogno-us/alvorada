@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import argparse
 import dataclasses
 import importlib
@@ -23,17 +24,17 @@ make_message = base.make_message
 parse_time = base.parse_time
 runtime_proposal_model = base.runtime_proposal_model
 
-CP_REVISION = "283500652d47a692fb0b99a1172a6d5faffbd9a7"
-MOLTBOT_REVISION = "1d308faf664c504b6e310db3c7a310153ef7b067"  # accepted dependency
+CP_REVISION = "2ea9528eeb87e14ff10f05de06473122b9df540f"
+MOLTBOT_REVISION = "177354e959cc78c59c1a776f018cfbfbf28c927b"  # accepted dependency
 MANIFEST_REVISION = "46c950bed37fe3812000895430bc0312d29e37ce"
-REPLAY_REVISION = "f63ce914504dd06813c4ccd199b0570dbd8dd427"
-ODES_REVISION = "cba83a1c06f718a8afd76178f36e5cc15896347d"
-EVIDENCE_PACK_REVISION = "f1a76187b72d5b7c9fded12580ba081cb9cba338"
+REPLAY_REVISION = "274543f1cd7171784a923a8e37015017a0d8bc9d"
+ODES_REVISION = "226adb0e3cde5377ac9db6f7e5857bfa7e65e30a"
+EVIDENCE_PACK_REVISION = "812194b9a89a5fa21e675200fcb4e0089666f1b6"
 ALVORADA_REVISION = "fb3d97938969a89e149e8ff8db2756091d1233fc"
 MOLTBOT_PRODUCER_PROFILE_ID = "urn:cognous:profiles:moltbot-safe-executor-producer"
-MOLTBOT_PRODUCER_PROFILE_VERSION = "1.0.0"
+MOLTBOT_PRODUCER_PROFILE_VERSION = "2.0.0"
 GAX_ARTIFACT_EXPORT_PROFILE = "urn:cognous:profiles:gax-retained-artifacts"
-GAX_ARTIFACT_EXPORT_VERSION = "1.0.0"
+GAX_ARTIFACT_EXPORT_VERSION = "1.1.0"
 
 
 def _repo_path(env_name: str, default: str) -> Path:
@@ -145,7 +146,7 @@ def _export_sources(
 def import_replay_bundle(cp_record: dict[str, Any], proposal: dict[str, Any] | None, moltbot: dict[str, Any] | None = None) -> Any:
     from agent_replay_bundle.importers import import_bounded_workflow
 
-    return import_bounded_workflow(cp_record, proposal=proposal, moltbot_export=moltbot)
+    return import_bounded_workflow(cp_record, proposal=proposal, moltbot_export=moltbot, control_plane_revision=CP_REVISION)
 
 
 def reconstruction_dict(reconstructed: Any) -> dict[str, Any]:
@@ -183,9 +184,27 @@ def _artifact_facts(odes_reference: dict[str, Any]) -> dict[str, Any]:
     effects = facts.get("destination_effects") or []
     effect_ids = [item.get("effect_id") for item in effects if isinstance(item, dict) and item.get("effect_id")]
     destination = facts.get("destination_observed")
-    ack = facts.get("acknowledgement_summary")
-    facts["pending_effects"] = effect_ids if destination == "partial" else []
-    facts["unresolved_delivery"] = bool(destination == "partial" or (ack == "unknown" and (effect_ids or destination in {"applied", "partial", "unknown"})))
+    # Pending identifies an attempted operation requiring reconciliation, not
+    # proof of a destination effect. Fresh absence cannot establish that an
+    # earlier in-flight request terminated. No finality contract is supplied by
+    # this producer generation; do not infer one from absence or retry denial.
+    attempted_ids = {
+        item["effect_id"]
+        for item in facts.get("control_plane_attempt_transitions", [])
+        if isinstance(item, dict) and item.get("effect_id")
+    }
+    attempted_ids.update(
+        item["effect_id"] for item in facts.get("execution_results", [])
+        if isinstance(item, dict) and item.get("attempted") and item.get("effect_id")
+    )
+    histories = facts.get("effect_observation_history") or {}
+    pending = []
+    for effect_id in sorted(attempted_ids | set(effect_ids)):
+        state = histories.get(effect_id, {}).get("latest_supported_destination_state", destination)
+        if state != "applied":
+            pending.append(effect_id)
+    facts["pending_effects"] = pending
+    facts["unresolved_delivery"] = bool(pending)
     return facts
 
 
@@ -353,7 +372,7 @@ def _retained_artifact_export(
 def _validate_retained_artifact_export(value: dict[str, Any]) -> str | None:
     if value.get("export_profile") != GAX_ARTIFACT_EXPORT_PROFILE:
         return "unsupported_artifact_export_profile"
-    if value.get("export_version") != GAX_ARTIFACT_EXPORT_VERSION:
+    if value.get("export_version") not in {"1.0.0", GAX_ARTIFACT_EXPORT_VERSION}:
         return "unsupported_artifact_export_version"
     reconstruction = value.get("reconstruction_bundle")
     odes = value.get("odes") or {}
@@ -430,6 +449,9 @@ def _execution_response(assessment: dict[str, Any], status: str, result: Any, de
             "effect_id": getattr(result, "effect_id", getattr(decision, "effect_id", None)),
             "decision_id": getattr(result, "decision_id", getattr(decision, "decision_id", None)),
             "attempt_id": getattr(result, "attempt_id", None),
+            "acknowledged": getattr(result, "acknowledged", None),
+            "observation": getattr(result, "observation", None),
+            "control_plane_evidence": getattr(result, "control_plane_evidence", None),
         },
         "current_reconstruction_bundle": artifacts["reconstruction_bundle"],
         "odes_reference": artifacts["odes_reference"],
@@ -480,6 +502,9 @@ def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], man
         assessment["errors"].append("GAX-EXECUTION-CHECKPOINT-INTEGRITY-FAILED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": problem, "attempt_status": "hold"}, "successor_packet": None}
     if checkpoint.get("moltbot") and checkpoint.get("result"):
+        contract = checkpoint["moltbot"].get("producer_profile") or {}
+        if contract.get("profile_version") != MOLTBOT_PRODUCER_PROFILE_VERSION:
+            return {"assessment": assessment, "execution": {"attempted": False, "reason": "historical_generation_requires_revision_pinned_recovery"}, "successor_packet": None}
         pipe = _pipeline(
             manifest,
             checkpoint["cp_record"],
@@ -534,7 +559,7 @@ def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], man
     return {"assessment": assessment, "execution": {"attempted": False, "reason": "checkpoint_without_dispatch_evidence", "attempt_status": "hold", "effect_id": checkpoint.get("effect_id"), "decision_id": checkpoint.get("decision_id")}, "successor_packet": None}
 
 
-def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], manifest: dict[str, Any], destination: Any, store_path: Path, resolver: Any, evaluation_time: str, execution_policy_factory: Any, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, store: "TransactionalExchangeStore" | None = None, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
+def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], manifest: dict[str, Any], destination: Any, store_path: Path, resolver: Any, evaluation_time: str, execution_policy_factory: Any, observation_policy: Any, observation_clock: Any = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, store: "TransactionalExchangeStore" | None = None, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
     runtime = load_executor_runtime()
     cp = runtime["cp"]
     now = parse_time(evaluation_time)
@@ -542,7 +567,7 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
     record_suffix = digest({"message_id": message["message_id"], "message_digest": message.get("message_digest"), "evaluation_time": evaluation_time})[-16:]
     record_store = cp.BoundedRecordStore(store_path.parent / f"control-plane-{message['message_id']}-{record_suffix}.json", proposal.run_id or "run-gax-imx")
     cp_destination = cp.LocalRefundDestination(store_path.parent / f"cp-placeholder-{message['message_id']}-{record_suffix}.json")
-    workflow = cp.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store)
+    workflow = cp.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver, destination=cp_destination, records=record_store, observation_policy=observation_policy)
     decision = workflow.decide(proposal, now=now)
     proposal_record = proposal.model_dump(mode="json", exclude_none=False)
     cp_record = record_store.load().model_dump(mode="json")
@@ -569,6 +594,7 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
         workflow=workflow,
         destination=destination,
         policy=policy,
+        observation_clock=observation_clock,
     )
     simulate = "partial" if partial_delivery else ("lost_ack" if lose_ack else None)
     result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=now, simulate=simulate)
@@ -589,7 +615,7 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
     return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, "proposal_record": p, "cp_record": cp_record, "moltbot_record": moltbot, **pipe}
 
 
-def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, execution_policy_factory: Any | None = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
+def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, execution_policy_factory: Any | None = None, observation_policy: Any | None = None, observation_clock: Any = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
     store_path = Path(store_path)
     store = TransactionalExchangeStore(store_path)
     duplicate, err = store.record_message(message)
@@ -621,7 +647,9 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
     if execution_policy_factory is None:
         assessment["errors"].append("GAX-EXECUTION-POLICY-REQUIRED")
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "execution_policy_factory_required"}, "successor_packet": None}
-    artifacts = _run_current_request(message=message, bundle=bundle, manifest=manifest, destination=destination, store_path=store_path, resolver=resolver, evaluation_time=evaluation_time, execution_policy_factory=execution_policy_factory, mutate_resolver_after_decision=mutate_resolver_after_decision, lose_ack=lose_ack, partial_delivery=partial_delivery, store=store, fault_after_dispatch=fault_after_dispatch, fault_evidence_once=fault_evidence_once)
+    if observation_policy is None:
+        return {"assessment": assessment, "execution": {"attempted": False, "reason": "observation_policy_required"}, "successor_packet": None}
+    artifacts = _run_current_request(message=message, bundle=bundle, manifest=manifest, destination=destination, store_path=store_path, resolver=resolver, evaluation_time=evaluation_time, execution_policy_factory=execution_policy_factory, observation_policy=observation_policy, observation_clock=observation_clock, mutate_resolver_after_decision=mutate_resolver_after_decision, lose_ack=lose_ack, partial_delivery=partial_delivery, store=store, fault_after_dispatch=fault_after_dispatch, fault_evidence_once=fault_evidence_once)
     result = artifacts.get("result")
     status = artifacts["status"]
     if artifacts.get("fault") == "after_dispatch_before_workflow_persistence":
@@ -630,6 +658,70 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
         return {"assessment": assessment, "execution": {"attempted": True, "attempt_status": "evidence_export_failed", "newly_executed": getattr(result, "newly_executed", False), "effect_id": getattr(result, "effect_id", None), "decision_id": getattr(result, "decision_id", None), "attempt_id": getattr(result, "attempt_id", None), "reason": artifacts["fault"]}, "successor_packet": None}
     store.record_workflow(message, artifacts)
     return _execution_response(assessment, status, result, artifacts["decision"], artifacts)
+
+
+def resume_original_exchange(message: dict[str, Any], *, manifest: dict[str, Any],
+        store_path: str | Path, destination: Any, resolver: Any,
+        execution_policy_factory: Any, observation_policy: Any,
+        evaluation_time: str, observation_clock: Any = None) -> dict[str, Any]:
+    """Explicit current observation of the original attempted effect, not redelivery.
+
+    Keeps original exports immutable. The accepted executor must see the owning
+    prior attempt; absence cannot become a replacement dispatch. A new recovery
+    artifact is saved separately. Reconciliation adds CP evidence, unlike an
+    evidence-only read/export, which must leave CP records unchanged.
+    """
+    if observation_policy is None:
+        raise ValueError("observation_policy is required")
+    now = parse_time(evaluation_time)
+    store_path = Path(store_path)
+    store = TransactionalExchangeStore(store_path)
+    association = store.workflow_for_message(message) or store.checkpoint_for_message(message)
+    if not association or _validate_bound_association(association):
+        raise ValueError("intact original workflow association required")
+    contract = (association.get("moltbot") or {}).get("producer_profile") or {}
+    if contract.get("profile_version") != MOLTBOT_PRODUCER_PROFILE_VERSION:
+        raise ValueError("historical producer generation requires its revision-pinned recovery path")
+    original = association["cp_record"]
+    if not any(a.get("effect_id") == association["effect_id"] for a in original.get("attempts", [])):
+        raise ValueError("retained owning prior attempt required; recovery cannot dispatch")
+    candidates = []
+    for path in store_path.parent.glob("control-plane-*.json"):
+        data = json.loads(path.read_text())
+        if data.get("run_id") != original.get("run_id") or data.get("decisions") != original.get("decisions"):
+            continue
+        if all(data.get(k, [])[:len(original.get(k, []))] == original.get(k, [])
+               for k in ("attempts", "observations", "reconciliations")):
+            candidates.append(path)
+    if len(candidates) != 1:
+        raise ValueError("owning Control Plane store unavailable or ambiguous")
+    runtime = load_executor_runtime(); cp = runtime["cp"]
+    proposal = cp.RuntimeProposal.model_validate(association["proposal"])
+    decision = cp.RuntimeDecision.model_validate(association["decision"])
+    request_data = dict(association["request"])
+    request_data["operation"] = runtime["ExecutionOperation"](**request_data["operation"])
+    request = runtime["ExecutionEnvelope"](**request_data)
+    workflow = cp.BoundedAuthorizationWorkflow(manifest=manifest, resolver=resolver,
+        destination=cp.LocalRefundDestination(store_path.parent / "recovery-placeholder.json"),
+        records=cp.BoundedRecordStore(candidates[0], proposal.run_id),
+        observation_policy=observation_policy)
+    executor = runtime["PinnedControlPlaneExecutor"](workflow=workflow, destination=destination,
+        policy=execution_policy_factory(request.operation), observation_clock=observation_clock)
+    result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=now)
+    if result.newly_executed:
+        raise RuntimeError("upstream invariant failure: recovery dispatched an effect")
+    cp_record, p, producer = _export_sources(workflow, proposal, request, result, destination)
+    pipe = _pipeline(manifest, cp_record, p, producer, predecessor=message,
+        state_version=len(cp_record.get("reconciliations", [])) + 1)
+    pipe["artifact_export"] = _retained_artifact_export(pipe,
+        state="reconciled_derivative", lineage={
+            "relationship": "observation_reconciliation_derivative",
+            "original_artifacts": "retained" if association.get("artifact_export") else "unavailable",
+            "source_checkpoint_commitment": digest(original), "effect_reexecution": False})
+    path = store_path.parent / ("recovery-" + digest(pipe["artifact_export"])[7:] + ".json")
+    path.write_text(_json_dumps(pipe["artifact_export"]) + "\n")
+    return _execution_response({"stages": {}, "errors": []}, result.status, result,
+        decision, pipe, attempted_override=False, newly_executed_override=False)
 
 
 class TransactionalExchangeStore:
@@ -859,7 +951,7 @@ def load_successor_packet(packet: dict[str, Any], destination: Any, *, predecess
 
 
 def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
-    from .synthetic_fixture import build_synthetic_resolver, synthetic_refund_policy
+    from .synthetic_fixture import build_synthetic_resolver, synthetic_refund_policy, synthetic_observation_policy, synthetic_observation_clock
 
     manifest = _manifest()
     bundle = json.loads(
@@ -895,6 +987,8 @@ def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
         store_path=store_path,
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         mutate_resolver_after_decision=mutate,
         lose_ack=lose_ack,
         partial_delivery=partial,
@@ -912,6 +1006,8 @@ def run_actual_outcome(tmp_path: Path, outcome: str) -> dict[str, Any]:
             store_path=store_path,
             resolver=resolver,
             execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         )
     return first
 
@@ -919,7 +1015,7 @@ def run_demo(manifest_path: str, replay_path: str, out_path: str) -> dict[str, A
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     bundle = json.loads(Path(replay_path).read_text(encoding="utf-8"))
     tmp = Path(out_path).parent
-    from .synthetic_fixture import build_synthetic_resolver, synthetic_refund_policy
+    from .synthetic_fixture import build_synthetic_resolver, synthetic_refund_policy, synthetic_observation_policy, synthetic_observation_clock
 
     proposal = runtime_proposal_model(bundle)
     resolver = build_synthetic_resolver(proposal, now=parse_time(EVAL))
@@ -935,6 +1031,8 @@ def run_demo(manifest_path: str, replay_path: str, out_path: str) -> dict[str, A
         store_path=tmp / "demo_exchange.sqlite",
         resolver=resolver,
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     Path(out_path).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     return result
