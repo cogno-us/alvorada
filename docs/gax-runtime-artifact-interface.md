@@ -8,12 +8,15 @@ The supported GAX runtime imports the public Moltbot Safe runtime modules:
 - producer export: `engine.producer_contract`
 - executor producer profile:
   `urn:cognous:profiles:moltbot-safe-executor-producer`
-- producer profile version: `1.0.0`
+- producer profile version: `2.0.0`
 - accepted Moltbot repository revision:
-  `1d308faf664c504b6e310db3c7a310153ef7b067`
+  `177354e959cc78c59c1a776f018cfbfbf28c927b`
 
 The runtime requires a caller-supplied trusted authority resolver and a
-caller-supplied execution-policy factory. It never constructs an authority grant
+caller-supplied execution-policy factory and explicit ObservationPolicy.
+The trusted timezone-aware evaluation time reaches the public executor; its
+observation clock may be explicitly supplied for deterministic tests. Production
+code does not inject a synthetic clock or observation policy. It never constructs an authority grant
 from incoming proposal content.
 
 Synthetic authority and policy construction remain in
@@ -24,7 +27,7 @@ Synthetic authority and policy construction remain in
 GAX retained artifact export:
 
 - profile: `urn:cognous:profiles:gax-retained-artifacts`
-- version: `1.0.0`
+- version: `1.1.0`
 
 The export retains:
 
@@ -67,22 +70,14 @@ explicit `attempt_identity` namespace and separately retained
 `control_plane_attempts` where applicable. GAX retains these producer
 references without relabeling them.
 
-## Consumer dependency status
+## Accepted observation-repair generation
 
-Batch 2 does not modify consumers.
+See the [Batch 4C-E checkpoint](workstreams/gax-producer-v2-checkpoint.md) for exact pins and executed results. Replay 0.2.0, executor producer 2.0.0 and ODES implementation profile 0.2 are consumed through their public APIs. The base pder-v0.1 schema is unchanged.
 
-For integration testing this branch pins:
+Artifact export 1.1.0 adds an explicit `reconciled_derivative` state for new observations of the original effect. `AcceptedGaxRecipientAdapter.resume_original(message, delivery_time=...)` uses the exact retained owning CP attempt/store and accepted executor. It saves a separate recovery artifact and leaves original exports and transport receipts unchanged. It requires an unambiguous owning store and the accepted producer generation. Recovery is not automatic redelivery. It adds CP reconciliation evidence; unlike evidence-only reads, it is expected to change CP records. It does not authorize replacement dispatch. Current authorization checks may deny this executor path; effect-free historical observation under revoked authority is not newly qualified here.
 
-- Replay proposed head:
-  `f63ce914504dd06813c4ccd199b0570dbd8dd427`
-- ODES proposed head:
-  `cba83a1c06f718a8afd76178f36e5cc15896347d`
+The original `recover` path remains evidence-only: when originals were never produced, it regenerates explicit derivatives from retained records without changing CP or destination state. Exact redelivery returns originals. Historical 1.0.0 exports remain readable as retained originals; historical execution/checkpoint regeneration requires the original revision-pinned runtime and is explicitly refused by the new recovery path rather than relabeled.
 
-The preserved Replay proposal currently recognizes producer profile 1.0.0 but
-pins Moltbot repository revision
-`054e92d12ccb0bc756ca6652f39fc13b51e05d9b`, the pre-merge feature head.
-It does not yet accept the merged dependency revision `1d308faf...`.
+Completeness and delivery are separate. An acknowledged real effect can have null validated observation and unresolved delivery. Accepted later applied evidence resolves delivery while retaining earlier rejection. Lost acknowledgement remains unknown in its original record even with applied observation; new reconciliation acknowledgements are separate and produce a mixed history. `observed_absent` does not confer retry permission. Control Plane and executor attempts retain their own namespaces.
 
-Alvorada does not relabel the merged producer as the pre-merge revision.
-Consumer acceptance of the merged Moltbot revision is therefore an explicit
-downstream dependency for the complete GAX artifact pipeline.
+Successor decision attribution remains null where the producer supplies none. No attribution is invented. Pending/unresolved state follows validated destination evidence, not reconstruction completeness or receipt labels. ODES recipient inspection remains unauthenticated with current authority unavailable under the reference policy.

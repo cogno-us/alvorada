@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from experiments.odex_gax_imx_reference.synthetic_fixture import synthetic_observation_policy, synthetic_observation_clock
+
 import json
 import os
 import sqlite3
@@ -96,6 +98,8 @@ def run_success(tmp_path: Path, *, message_id: str = "m-success", destination=No
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
     )
     return msg, destination, result
 
@@ -111,6 +115,8 @@ def redeliver(tmp_path: Path, msg: dict, destination, *, partial_delivery: bool 
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver or resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         partial_delivery=partial_delivery,
         lose_ack=lose_ack,
     )
@@ -149,6 +155,8 @@ def test_partial_delivery_exact_redelivery_preserves_pending_and_unresolved(tmp_
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         partial_delivery=True,
     )
     original_effect = first["execution"]["effect_id"]
@@ -164,7 +172,7 @@ def test_partial_delivery_exact_redelivery_preserves_pending_and_unresolved(tmp_
     assert_artifacts(replayed)
 
 
-def test_lost_ack_exact_redelivery_preserves_unknown_unresolved_without_second_effect(tmp_path):
+def test_lost_ack_exact_redelivery_preserves_unknown_ack_and_applied_effect(tmp_path):
     destination = destination_at(tmp_path)
     msg = make_message(success_bundle(), message_id="m-lost-ack")
     first = run_exchange(
@@ -177,6 +185,8 @@ def test_lost_ack_exact_redelivery_preserves_unknown_unresolved_without_second_e
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         lose_ack=True,
     )
     original_effect = first["execution"]["effect_id"]
@@ -185,7 +195,9 @@ def test_lost_ack_exact_redelivery_preserves_unknown_unresolved_without_second_e
 
     assert replayed["execution"]["attempt_status"] == "unknown"
     assert replayed["execution"]["effect_id"] == original_effect
-    assert replayed["successor_packet"]["unresolved_delivery"] is True
+    assert replayed["successor_packet"]["unresolved_delivery"] is False
+    assert replayed["execution"]["acknowledged"] is False
+    assert replayed["execution_facts"]["acknowledgement_summary"] == "unknown"
     assert replayed["successor_packet"]["pending_effects"] == []
     assert len(effect_rows(destination)) == 1
     assert_artifacts(replayed)
@@ -209,6 +221,8 @@ def test_receipt_then_failure_before_effect_redelivery_returns_evidence_not_shor
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         mutate_resolver_after_decision=revoke,
     )
     assert first["execution"]["attempt_status"] == "denied"
@@ -283,6 +297,8 @@ def test_checkpoint_after_destination_commit_recovers_original_effect_without_re
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         fault_after_dispatch=True,
     )
     original_effect = interrupted["execution"]["effect_id"]
@@ -313,6 +329,8 @@ def test_checkpoint_recovery_with_changed_policy_does_not_issue_replacement_refu
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         fault_after_dispatch=True,
     )
     original_effect = interrupted["execution"]["effect_id"]
@@ -342,6 +360,8 @@ def test_replay_odes_failure_after_commit_retries_evidence_without_repeating_eff
         store_path=tmp_path / "exchange.sqlite",
         resolver=resolver_for(),
         execution_policy_factory=synthetic_refund_policy,
+        observation_policy=synthetic_observation_policy(),
+        observation_clock=synthetic_observation_clock,
         fault_evidence_once=True,
     )
     original_effect = interrupted["execution"]["effect_id"]
