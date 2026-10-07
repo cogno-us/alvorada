@@ -719,7 +719,13 @@ def resume_original_exchange(message: dict[str, Any], *, manifest: dict[str, Any
     # Preserve the accepted historical reconstruction unchanged and express the
     # recovery denial only in derivative lineage and the returned execution
     # surface.  No fresh destination observation is claimed on this path.
-    if result.status == "denied":
+    recovery_result = _asdict(result)
+    recovery_evidence = recovery_result.get("control_plane_evidence") or {}
+    recovery_reconciliation = (
+        recovery_evidence.get("reconciliation")
+        if isinstance(recovery_evidence, dict) else None
+    )
+    if result.status == "denied" and not recovery_reconciliation:
         pipe = _artifacts_from_association(manifest, message, association)
         original_export = association.get("artifact_export")
         pipe["artifact_export"] = _retained_artifact_export(
@@ -734,6 +740,8 @@ def resume_original_exchange(message: dict[str, Any], *, manifest: dict[str, Any
                 "recovery_evaluated_at": evaluation_time,
                 "recovery_scope": "current_authority_revalidation_before_destination_observation",
                 "recovery_status": "denied",
+                "recovery_reason": recovery_result.get("error"),
+                "recovery_result": recovery_result,
                 "destination_observation_performed": False,
                 "replacement_dispatch_performed": False,
                 "renewed_authorization": False,
