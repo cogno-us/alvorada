@@ -427,6 +427,12 @@ def _artifacts_from_retained_export(value: dict[str, Any]) -> dict[str, Any]:
         },
         "successor_packet": value.get("successor_packet"),
         "execution_facts": facts,
+        # The retained export has already passed commitment/identity validation.
+        # Preserve every producer reference actually present so a derivative
+        # does not erase historical decision/effect/attempt provenance. The
+        # artifact-specific references and commitments are recomputed normally
+        # by _retained_artifact_export when the derivative is constructed.
+        "producer_identity_refs": json.loads(_json_dumps(value.get("producer_refs") or {})),
         "artifact_export": value,
     }
 
