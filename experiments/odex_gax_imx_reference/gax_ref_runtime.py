@@ -710,6 +710,47 @@ def resume_original_exchange(message: dict[str, Any], *, manifest: dict[str, Any
     result = executor.execute(envelope=request, proposal=proposal, decision=decision, now=now)
     if result.newly_executed:
         raise RuntimeError("upstream invariant failure: recovery dispatched an effect")
+
+    # A current recovery denial is a new authority fact about this recovery
+    # request, not a revision of the historical execution that produced (or did
+    # not produce) the original effect.  Re-exporting the denied executor result
+    # together with retained historical destination rows would collapse those
+    # two episodes and correctly trigger Replay's denied/effect contradiction.
+    # Preserve the accepted historical reconstruction unchanged and express the
+    # recovery denial only in derivative lineage and the returned execution
+    # surface.  No fresh destination observation is claimed on this path.
+    if result.status == "denied":
+        pipe = _artifacts_from_association(manifest, message, association)
+        original_export = association.get("artifact_export")
+        pipe["artifact_export"] = _retained_artifact_export(
+            pipe,
+            state="recovery_denied_derivative",
+            lineage={
+                "relationship": "recovery_denial_derivative",
+                "original_artifacts": "retained" if original_export else "unavailable",
+                "source_checkpoint_commitment": digest(original),
+                "source_artifact_commitment": digest(original_export) if isinstance(original_export, dict) else None,
+                "effect_reexecution": False,
+                "recovery_evaluated_at": evaluation_time,
+                "recovery_scope": "current_authority_revalidation_before_destination_observation",
+                "recovery_status": "denied",
+                "destination_observation_performed": False,
+                "replacement_dispatch_performed": False,
+                "renewed_authorization": False,
+            },
+        )
+        path = store_path.parent / ("recovery-" + digest(pipe["artifact_export"])[7:] + ".json")
+        path.write_text(_json_dumps(pipe["artifact_export"]) + "\n")
+        return _execution_response(
+            {"stages": {}, "errors": []},
+            result.status,
+            result,
+            decision,
+            pipe,
+            attempted_override=False,
+            newly_executed_override=False,
+        )
+
     cp_record, p, producer = _export_sources(workflow, proposal, request, result, destination)
     pipe = _pipeline(manifest, cp_record, p, producer, predecessor=message,
         state_version=len(cp_record.get("reconciliations", [])) + 1)
