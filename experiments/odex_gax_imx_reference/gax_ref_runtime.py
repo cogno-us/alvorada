@@ -184,9 +184,27 @@ def _artifact_facts(odes_reference: dict[str, Any]) -> dict[str, Any]:
     effects = facts.get("destination_effects") or []
     effect_ids = [item.get("effect_id") for item in effects if isinstance(item, dict) and item.get("effect_id")]
     destination = facts.get("destination_observed")
-    ack = facts.get("acknowledgement_summary")
-    facts["pending_effects"] = effect_ids if destination in {"partial", "unknown"} else []
-    facts["unresolved_delivery"] = bool(destination in {"partial", "unknown"} and (effect_ids or facts.get("reconciliations")))
+    # Pending identifies an attempted operation requiring reconciliation, not
+    # proof of a destination effect. Fresh absence cannot establish that an
+    # earlier in-flight request terminated. No finality contract is supplied by
+    # this producer generation; do not infer one from absence or retry denial.
+    attempted_ids = {
+        item["effect_id"]
+        for item in facts.get("control_plane_attempt_transitions", [])
+        if isinstance(item, dict) and item.get("effect_id")
+    }
+    attempted_ids.update(
+        item["effect_id"] for item in facts.get("execution_results", [])
+        if isinstance(item, dict) and item.get("attempted") and item.get("effect_id")
+    )
+    histories = facts.get("effect_observation_history") or {}
+    pending = []
+    for effect_id in sorted(attempted_ids | set(effect_ids)):
+        state = histories.get(effect_id, {}).get("latest_supported_destination_state", destination)
+        if state != "applied":
+            pending.append(effect_id)
+    facts["pending_effects"] = pending
+    facts["unresolved_delivery"] = bool(pending)
     return facts
 
 

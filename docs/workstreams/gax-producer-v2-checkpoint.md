@@ -30,7 +30,7 @@ Executor producer 2.0.0; Execution Envelope and Reconstruction Bundle 0.2.0; ODE
 
 ## Validation
 
-Local Python 3.12.14: **87 passed, zero failures, zero skips**, including 9 new observation-repair tests. Demo command passed. Focused integration checks ran first. Initial full gate exposed two historical acknowledgement/delivery conflation assertions and a new test's early transport retry; these were corrected without weakening partial-delivery or unknown-acknowledgement requirements.
+Local Python 3.12.14: **88 passed, zero failures, zero skips**, including 10 observation-repair tests. Demo command passed. Focused integration checks ran first. Initial full gate exposed two historical acknowledgement/delivery conflation assertions and a new test's early transport retry; these were corrected without weakening partial-delivery or unknown-acknowledgement requirements.
 
 ```sh
 # Configure the exact checkouts from .github/workflows/tests.yml.
@@ -45,3 +45,10 @@ CI runs Python 3.11/3.12, verifies exact pins, and uploads actual scenario resul
 ## Remaining limits and next step
 
 Governor review; no self-merge. The next bounded batch is the hub pin update and remaining Batch 4C qualification, including cases 3–5 and research extensions. This batch does not modify the hub lock or adjacent implementations. Same-host SQLite/store evidence does not establish distributed delivery, cross-host budget enforcement, production authentication, live confinement, independent verification or effective human oversight. Original-effect recovery requires a unique accessible owning local CP store; concurrent multi-process recovery is not newly qualified. No population reconciliation, deployment applicability or human-oversight study was added.
+
+
+## Targeted prior-absence correction
+
+Reviewed head: `1d67ec092c14bbedea9ba421d8fc3fb5f4653853`. The earlier derivation incorrectly cleared pending delivery after fresh absence despite an unknown prior attempt. Pending reconciliation now uses original attempted effect identities, independently of destination effect rows. Fresh absence is not evidence of termination/finality; this producer generation supplies no finality contract. The result remains `pending_effects=[original_effect_id]`, `unresolved_delivery=true`, zero actual destination effects, and `retry_eligible=false`. It does not claim that an effect occurred or grant retry permission.
+
+Public transport/redelivery and `resume_original` regressions preserve that uncertainty and prevent replacement effects. Held/denied-before-attempt paths have no pending effect. Accepted applied recovery clears pending delivery while preserving historical acknowledgements/rejections. Results were regenerated through actual producers; dependency pins and all prior checks remain unchanged. Full suite: 88 passed, no failures/skips.

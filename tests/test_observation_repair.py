@@ -61,6 +61,14 @@ def test_transport_repaired_chain(tmp_path, mode):
         assert retained['successor_packet']['unresolved_delivery'] is True
     if mode == 'lost_ack':
         assert result['acknowledged'] is False and result['observed_state'] == 'applied'
+    if mode == 'prior_absence':
+        assert retained['successor_packet']['pending_effects'] == [effect]
+        assert retained['successor_packet']['unresolved_delivery'] is True
+        assert result['acknowledged'] is False
+    if mode == 'revoked':
+        assert retained['successor_packet']['pending_effects'] == []
+        assert retained['successor_packet']['unresolved_delivery'] is False
+        assert not records('control_plane_attempt_transition')
     if mode == 'partial':
         assert bundle['status'] == 'reconstruction_complete'
         assert retained['successor_packet']['unresolved_delivery'] is True
@@ -91,9 +99,16 @@ def test_transport_repaired_chain(tmp_path, mode):
             assert recovered['execution']['attempt_status'] == 'denied'
             recs = recovered['execution_facts']['reconciliations']
             assert recs[-1]['result'] == 'observed_absent' and recs[-1]['retry_eligible'] is False
+            assert recovered['execution_facts']['pending_effects'] == [effect]
+            assert recovered['execution_facts']['unresolved_delivery'] is True
+            assert recovered['successor_packet']['pending_effects'] == [effect]
+            assert recovered['successor_packet']['unresolved_delivery'] is True
+            assert recovered['execution_facts']['destination_effects'] == []
+            assert recovered['execution_facts']['acknowledgement_summary'] == 'unknown'
         else:
             assert recovered['execution_facts']['destination_observed'] == 'applied'
             assert recovered['successor_packet']['unresolved_delivery'] is False
+            assert recovered['successor_packet']['pending_effects'] == []
             if mode in {'wrong_effect','unavailable'}:
                 assert any(not r['observation_accepted'] for r in recovered['execution_facts']['reconciliations'])
         if mode == 'lost_ack':
@@ -109,6 +124,8 @@ def test_transport_repaired_chain(tmp_path, mode):
             'effect_id':effect, 'decision_id':result['decision_id'],
             'attempt_identity':retained['producer_refs'].get('attempt_identity'),
             'destination':dest.observe(effect), 'effect_count':count,
+            'initial_pending_effects':retained['successor_packet']['pending_effects'],
+            'initial_unresolved_delivery':retained['successor_packet']['unresolved_delivery'],
             'initial_acknowledged':result['acknowledged'],
             'initial_observed_state':result['observed_state'],
             'reconstruction_status':bundle['status'],
@@ -125,3 +142,19 @@ def test_missing_observation_policy_fails_closed(tmp_path):
     result = handler.handle(message, delivery_time=EVAL)
     assert result.execution['reason'] == 'observation_policy_required'
     assert effect_count(dest) == 0
+
+
+def test_transport_held_before_attempt_has_no_pending_effect(tmp_path):
+    transport, dest, message, handler = _accepted_transport(tmp_path, 'held-before-attempt')
+    for status in handler.resolver.statuses.values():
+        status.status = 'revoked'
+    transport.deliver(message['message_id'], now=EVAL)
+    retained = transport.retained_artifacts(message['message_id'])['artifact_export']
+    assert retained['successor_packet']['pending_effects'] == []
+    assert retained['successor_packet']['unresolved_delivery'] is False
+    assert not any(r['record_type'] == 'control_plane_attempt_transition' for r in retained['reconstruction_bundle']['records'])
+    assert effect_count(dest) == 0
+    before = snapshot(dest, tmp_path)
+    transport.deliver(message['message_id'], now=EVAL, force=True)
+    assert transport.retained_artifacts(message['message_id'])['artifact_export'] == retained
+    assert snapshot(dest, tmp_path) == before
