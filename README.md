@@ -21,7 +21,7 @@
 
 An experimental GAX/IMX reference that connects governed messages, recipient assessment, bounded execution and retained evidence. It is separate from the constitutional authority repository: this workbench implements exchange behavior and local transport, not an institution or a constitution.
 
-**Implementation status:** this README describes merged public reference work. Component acceptance, selection in the hub and execution of a qualification are separate facts. The selected revision for this component is `9984d9011568ccdf3d562fa9760ad41368947b34`; the [hub lock](https://github.com/cogno-us/cognous-open-control-stack/blob/5737267d94d2b445735c95e8480a31de73a2abe8/component-lock.json) is the source of that integration choice.
+**Implementation and selection (2026-10-10):** The current [hub component lock](https://github.com/cogno-us/cognous-open-control-stack/blob/main/component-lock.json) selects GAX `a1cbc7b28f702283b0e4f3192bb43e4a9e618ebf`. This repository has separately accepted optional generation-fence source `814927dac65a2078d5efee6bbf07c46091844822`; that source is **not automatically selected or enabled** by the hub. The earlier `9984d9011568ccdf3d562fa9760ad41368947b34` and hub `5737267d...` are **historical qualification references**, retained below for provenance. [Release status](https://github.com/cogno-us/cognous-open-control-stack/blob/main/docs/release-status.md) governs release claims; deployment trust remains [HOLD](https://github.com/cogno-us/cognous-stack-orchestrator/issues/30).
 
 ## Purpose and intended users
 
@@ -44,6 +44,17 @@ Engineers can inspect the reference contracts and examples; enterprise architect
 LocalDurableTransport delivers a synthetic refund message to AcceptedGaxRecipientAdapter. GAX assesses the message and routes the Manifest-bound proposal through the trusted runtime. Redelivery returns the retained original artifacts when available. If evidence was never retained after an effect, evidence-only recovery creates an explicitly derived record without issuing a replacement effect.
 
 A valid signature, chain inclusion, message receipt, reasoning instruction or evidence-package digest does not authorize execution. Institutional authority must be supplied and evaluated through the appropriate trusted boundary.
+
+## Example: two generations and a late result
+
+Suppose a synthetic refund conversation has an authoritative local lineage head **generation 5**, while a delayed worker still claims **generation 4**.
+
+1. The optional `LineageGenerationFence` reads the authoritative local generation from the same SQLite lineage store under its local commit lock.
+2. The version-4 effect is **refused before local commit** as `superseded_lineage_generation`. A minimal record binds the claimed effect, expected and authoritative generations, and refusal reason; ordinary refusal logs do not need the raw payload.
+3. The persisted refusal counter survives restart. Once the configured record limit is reached, later refusals increment bounded suppression counters instead of expanding individual logs indefinitely.
+4. A generation-5 claim may proceed to its **synthetic local destination** only if independently supplied institutional authorization and other execution prerequisites are satisfied. Matching a lineage generation does **not** grant those permissions.
+
+The accepted source implementation is [`generation_fence.py`](experiments/odex_gax_imx_reference/generation_fence.py), with [source-owned negative tests](tests/test_generation_fence.py). The [O6-Q4 orchestration qualification](https://github.com/cogno-us/cognous-stack-orchestrator/blob/main/development/acceptance/o6-q4/README.md) exercises it alongside actual pinned synthetic Control Plane and Runtime interfaces, but does not establish distributed atomicity or production settlement. A stale message receipt cannot authorize a replacement refund, and a timeout or observed absence never makes a blind retry safe.
 
 ## Getting started
 
