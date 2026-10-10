@@ -1,0 +1,40 @@
+name: Generation fence
+
+on:
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "experiments/odex_gax_imx_reference/generation_fence.py"
+      - "experiments/odex_gax_imx_reference/gax_ref_runtime.py"
+      - "tests/test_generation_fence.py"
+      - "docs/generation-fence.md"
+      - ".github/workflows/generation-fence.yml"
+  push:
+    branches:
+      - "worker/o6-p2a-generation-fence"
+    paths:
+      - "experiments/odex_gax_imx_reference/generation_fence.py"
+      - "experiments/odex_gax_imx_reference/gax_ref_runtime.py"
+      - "tests/test_generation_fence.py"
+      - "docs/generation-fence.md"
+      - ".github/workflows/generation-fence.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bounded-generation-fence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install bounded workbench
+        run: python -m pip install -e '.[dev]'
+      - name: Run generation-fence qualification
+        run: python -m pytest -q tests/test_generation_fence.py
