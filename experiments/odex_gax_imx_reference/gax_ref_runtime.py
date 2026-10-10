@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .generation_fence import GenerationFenceClaim
 from . import gax_ref as base
 
 PROFILE = base.PROFILE
@@ -577,7 +578,7 @@ def _recover_checkpoint(message: dict[str, Any], assessment: dict[str, Any], man
     return {"assessment": assessment, "execution": {"attempted": False, "reason": "checkpoint_without_dispatch_evidence", "attempt_status": "hold", "effect_id": checkpoint.get("effect_id"), "decision_id": checkpoint.get("decision_id")}, "successor_packet": None}
 
 
-def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], manifest: dict[str, Any], destination: Any, store_path: Path, resolver: Any, evaluation_time: str, execution_policy_factory: Any, observation_policy: Any, observation_clock: Any = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, store: "TransactionalExchangeStore" | None = None, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
+def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], manifest: dict[str, Any], destination: Any, store_path: Path, resolver: Any, evaluation_time: str, execution_policy_factory: Any, observation_policy: Any, observation_clock: Any = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, store: "TransactionalExchangeStore" | None = None, fault_after_dispatch: bool = False, fault_evidence_once: bool = False, generation_fence: Any = None, lineage_generation: int | None = None) -> dict[str, Any]:
     runtime = load_executor_runtime()
     cp = runtime["cp"]
     now = parse_time(evaluation_time)
@@ -603,6 +604,16 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
         mutate_resolver_after_decision(resolver)
 
     request = _build_request_from_decision(runtime, proposal, resolver, decision)
+    execution_destination = destination
+    if (generation_fence is None) != (lineage_generation is None):
+        raise ValueError("generation_fence and lineage_generation must be supplied together")
+    if generation_fence is not None:
+        claim = GenerationFenceClaim(
+            conversation_id=message["conversation_id"],
+            effect_id=decision.effect_id,
+            generation=int(lineage_generation),
+        )
+        execution_destination = generation_fence.wrap_destination(destination, claim)
     if store is not None:
         store.record_dispatch_checkpoint(message, {"status": "bound", "proposal_record": proposal_record, "decision": _asdict(decision), "request": _asdict(request), "cp_record": cp_record})
     policy = execution_policy_factory(request.operation)
@@ -610,7 +621,7 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
         raise TypeError("execution_policy_factory must return LocalExecutionPolicy")
     executor = runtime["PinnedControlPlaneExecutor"](
         workflow=workflow,
-        destination=destination,
+        destination=execution_destination,
         policy=policy,
         observation_clock=observation_clock,
     )
@@ -633,7 +644,7 @@ def _run_current_request(*, message: dict[str, Any], bundle: dict[str, Any], man
     return {"status": result.status, "result": result, "decision": decision, "request": request, "destination": destination, "destination_effects": {row["effect_id"]: row for row in _effect_rows(destination)}, "proposal_record": p, "cp_record": cp_record, "moltbot_record": moltbot, **pipe}
 
 
-def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, execution_policy_factory: Any | None = None, observation_policy: Any | None = None, observation_clock: Any = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, fault_after_dispatch: bool = False, fault_evidence_once: bool = False) -> dict[str, Any]:
+def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: LocalRegistry, destination: Any, *, evaluation_time: str, manifest: dict[str, Any], store_path: str | Path, resolver: Any | None = None, execution_policy_factory: Any | None = None, observation_policy: Any | None = None, observation_clock: Any = None, mutate_resolver_after_decision=None, lose_ack: bool = False, partial_delivery: bool = False, fault_after_dispatch: bool = False, fault_evidence_once: bool = False, generation_fence: Any = None, lineage_generation: int | None = None) -> dict[str, Any]:
     store_path = Path(store_path)
     store = TransactionalExchangeStore(store_path)
     duplicate, err = store.record_message(message)
@@ -667,7 +678,7 @@ def run_exchange(message: dict[str, Any], bundle: dict[str, Any], registry: Loca
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "execution_policy_factory_required"}, "successor_packet": None}
     if observation_policy is None:
         return {"assessment": assessment, "execution": {"attempted": False, "reason": "observation_policy_required"}, "successor_packet": None}
-    artifacts = _run_current_request(message=message, bundle=bundle, manifest=manifest, destination=destination, store_path=store_path, resolver=resolver, evaluation_time=evaluation_time, execution_policy_factory=execution_policy_factory, observation_policy=observation_policy, observation_clock=observation_clock, mutate_resolver_after_decision=mutate_resolver_after_decision, lose_ack=lose_ack, partial_delivery=partial_delivery, store=store, fault_after_dispatch=fault_after_dispatch, fault_evidence_once=fault_evidence_once)
+    artifacts = _run_current_request(message=message, bundle=bundle, manifest=manifest, destination=destination, store_path=store_path, resolver=resolver, evaluation_time=evaluation_time, execution_policy_factory=execution_policy_factory, observation_policy=observation_policy, observation_clock=observation_clock, mutate_resolver_after_decision=mutate_resolver_after_decision, lose_ack=lose_ack, partial_delivery=partial_delivery, store=store, fault_after_dispatch=fault_after_dispatch, fault_evidence_once=fault_evidence_once, generation_fence=generation_fence, lineage_generation=lineage_generation)
     result = artifacts.get("result")
     status = artifacts["status"]
     if artifacts.get("fault") == "after_dispatch_before_workflow_persistence":
