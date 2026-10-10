@@ -83,7 +83,7 @@ class LineageGenerationFence:
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS generation_refusals_conversation
-                    ON generation_refusals(conversation_id, rowid);
+                    ON generation_refusals(conversation_id);
                 CREATE TABLE IF NOT EXISTS generation_refusal_counters(
                     conversation_id TEXT PRIMARY KEY,
                     total_refusals INTEGER NOT NULL,
